@@ -16,9 +16,6 @@ export const FF_DEV_1284 = 'fflag_fix_front_dev_1284_auto_detect_undo_281022_sho
 // Fix crosshair working with zoom & rotation
 export const FF_DEV_1285 = 'ff_front_dev_1285_crosshair_wrong_zoom_140122_short';
 
-// Add visibleWhen="choice-unselected" option
-export const FF_DEV_1372 = 'ff_front_dev_1372_visible_when_choice_unselected_11022022_short';
-
 export const FF_DEV_1442 = 'ff_front_dev_1442_unselect_shape_on_click_outside_080622_short';
 
 // Keep enabled state of video region on area transformations
@@ -45,26 +42,14 @@ export const FF_DEV_1621 = 'ff_front_dev_1621_interactive_mode_150222_short';
 // New Audio 2.0 UI
 export const FF_DEV_1713 = 'ff_front_DEV_1713_audio_ui_150222_short';
 
-// Rework of Choices tag
-export const FF_DEV_2007 = 'ff_dev_2007_rework_choices_280322_short';
-
-// Add ability to generate children tags from task data
-export const FF_DEV_2007_DEV_2008 = 'ff_dev_2007_dev_2008_dynamic_tag_children_250322_short';
-
 // Clean unnecessary classification areas after deserialization
 export const FF_DEV_2100 = 'ff_dev_2100_clean_unnecessary_areas_140422_short';
-
-// Fix preselected choices
-export const FF_DEV_2100_A = 'ff_dev_2100_preselected_choices_250422_short';
 
 // Allow to use html inside <Label/> tags
 export const FF_DEV_2128 = 'ff_dev_2128_html_in_labels_150422_short';
 
 // 3-point Rectangle tool to created rotated bboxes conveniently
 export const FF_DEV_2132 = 'ff_front_dev_2132_rotating_bounding_box';
-
-// Make nested choices work according to the DES-107
-export const FF_DEV_2244 = 'ff_front_dev_2244_nested_choices_des_107_160522_short';
 
 // Show draft as the topmost item in annotation history
 export const FF_DEV_2290 = 'ff_front_dev_2290_draft_in_annotation_history_short';
@@ -188,7 +173,7 @@ export const FF_LSDV_1148 = 'fflag_fix_font_lsdv_1148_hotkeys_namespaces_0102202
 export const FF_LSDV_4583 = 'fflag_feat_front_lsdv_4583_multi_image_segmentation_short';
 
 /**
- * Enables new way of preloading/cacheing images
+ * Enables new way of preloading/caching images
  */
 export const FF_LSDV_4583_6 = 'fflag_feat_front_lsdv_4583_6_images_preloading_short';
 
@@ -201,8 +186,13 @@ export const FF_LSDV_4583_6 = 'fflag_feat_front_lsdv_4583_6_images_preloading_sh
 export const FF_LSDV_3009 = 'fflag_fix_font_lsdv_3009_draft_saving_stuck_130223_short';
 
 /**
- * Adding "skipDuplicates" parameter for <TextArea /> to preventing adding duplicate entries
- *
+ * Allows to count time spend on textarea results and store it to lead_time meta field
+ * @link https://app.launchdarkly.com/default/production/features/fflag_fix_front_lsdv_4600_lead_time_27072023_short
+ */
+export const FF_LEAD_TIME = 'fflag_fix_front_lsdv_4600_lead_time_27072023_short';
+
+/**
+ * Adds "skipDuplicates" parameter for <TextArea /> to prevent adding duplicate entries
  * @link https://app.launchdarkly.com/default/production/features/fflag_feat_front_lsdv_4659_skipduplicates_060323_short
  */
 export const FF_LSDV_4659 = 'fflag_feat_front_lsdv_4659_skipduplicates_060323_short';
@@ -276,15 +266,12 @@ export const FF_LSDV_4930 = 'fflag_fix_front_lsdv_4930_selection_tool_fixes_2404
 
 /**
  * Restore "hide all regions" button functionality in the outliner
- *
- * @link https://app.launchdarkly.com/default/production/features/fflag_fix_front_lsdv_4998_missed_dynamic_children_030523_short
+ * @link https://app.launchdarkly.com/default/production/features/fflag_fix_front_lsdv_4992_hide_all_regions_04052023_short
  */
 export const FF_LSDV_4992 = 'fflag_fix_front_lsdv_4992_hide_all_regions_04052023_short';
 
 /**
  * Resetting shared stores on task change to correctly generate dynamic children
- *
- * @see: ff_dev_2007_dev_2008_dynamic_tag_children_250322_short: To enable dynamic children
  * @see: fflag_fix_front_dev_3617_taxonomy_memory_leaks_fix: To enable shared store
  * @link https://app.launchdarkly.com/default/production/features/fflag_fix_front_lsdv_4998_missed_dynamic_children_030523_short
  */
@@ -292,9 +279,63 @@ export const FF_LSDV_4998 = 'fflag_fix_front_lsdv_4998_missed_dynamic_children_0
 
 /**
  * Add ability to show hints while hover over the choice
- * @see: ff_dev_2007_rework_choices_280322_short: To enable alt version of <Choices/> (it's not necessary)
  */
 export const FF_PROD_309 = 'fflag_feat_front_prod_309_choice_hint_080523_short';
+
+/**
+ * Fix delay on double-click interactions in Image Segmentation
+ * @link https://app.launchdarkly.com/default/production/features/fflag_fix_front_lsdv_5248_double_click_delay_280823_short
+ */
+export const FF_DBLCLICK_DELAY = 'fflag_fix_front_lsdv_5248_double_click_delay_280823_short';
+
+/**
+ * Allow to load Taxonomy from remote API
+ * @link https://app.launchdarkly.com/default/production/features/fflag_feat_front_lsdv_5451_async_taxonomy_110823_short
+ */
+export const FF_TAXONOMY_ASYNC = 'fflag_feat_front_lsdv_5451_async_taxonomy_110823_short';
+
+export const FF_LEAP_218 = 'fflag_fix_front_leap_218_improve_performance_of_taxonomy_search_short';
+
+/**
+ * Allow to label NER directly with Taxonomy instead of Labels
+ * @link https://app.launchdarkly.com/default/production/features/fflag_feat_front_lsdv_5452_taxonomy_labeling_110823_short
+ */
+export const FF_TAXONOMY_LABELING = 'fflag_feat_front_lsdv_5452_taxonomy_labeling_110823_short';
+
+/**
+ * Fix task count on projects with over 100 tasks (switch from task history to queue count)
+ * @link https://app.launchdarkly.com/default/production/features/fflag_fix_all_optic_79_task_count_is_wrong_short/targeting
+ */
+
+export const FF_TASK_COUNT_FIX = 'fflag_fix_all_optic_79_task_count_is_wrong_short';
+/** 
+* Annotator workflow control for lead time calculation
+ */
+export const FF_PROD_E_111 = 'fflag_feat_front_prod_e_111_annotator_workflow_control_short';
+
+/**
+ * Adding a property snap to Polygon, PolygonLabels, KeyPoint and KeyPoinLabels to snap points to image pixel when user sets snap="pixel".
+ */
+export const FF_SNAP_TO_PIXEL = 'fflag_feat_front_lsdv_5518_snap_to_pixel_130923_short';
+
+/** Fix taxonomy items init with DEV-3617 FF on; this allows to correctly preselect items on init */
+export const FF_TAXONOMY_SELECTED = 'fflag_fix_front_leap_149_taxonomy_selected_true_short';
+
+/** Skip video to region start when it's selected in the outliner */
+export const FF_LEAP_187 = 'fflag_feat_front_leap_187_video_seek_on_select_short';
+
+/** Select annotation only once during store init and trigger the rest from this select */
+export const FF_SIMPLE_INIT = 'fflag_fix_front_leap_443_select_annotation_once';
+
+/**
+ * Optimize stage rendering for large number of regions and zoom interactions
+ * @link https://app.launchdarkly.com/default/production/features/fflag_fix_front_leap_32_zoom_perf_190923_short/targeting
+ */
+export const FF_ZOOM_OPTIM = 'fflag_fix_front_leap_32_zoom_perf_190923_short';
+
+export const FF_SAFE_TEXT = 'fflag_fix_leap_466_text_sanitization';
+
+export const FF_MULTI_OBJECT_HOTKEYS = 'fflag_fix_leap_246_multi_object_hotkeys_160124_short';
 
 Object.assign(window, {
   APP_SETTINGS: {

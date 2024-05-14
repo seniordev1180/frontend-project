@@ -1,4 +1,4 @@
-import { destroy as destroyNode, flow, getType, types } from 'mobx-state-tree';
+import { destroy as destroyNode, flow, types } from 'mobx-state-tree';
 import { createRef } from 'react';
 import { customTypes } from '../../../core/CustomTypes';
 import { errorBuilder } from '../../../core/DataValidator/ConfigValidator';
@@ -14,12 +14,10 @@ import { findRangeNative, rangeToGlobalOffset } from '../../../utils/selection-t
 import { escapeHtml, isValidObjectURL } from '../../../utils/utilities';
 import ObjectBase from '../Base';
 import { cloneNode } from '../../../core/Helpers';
-import { FF_LSDV_4620_3, isFF } from '../../../utils/feature-flags';
+import { FF_LSDV_4620_3, FF_SAFE_TEXT, isFF } from '../../../utils/feature-flags';
 import DomManager from './domManager';
 import { STATE_CLASS_MODS } from '../../../mixins/HighlightMixin';
 import Constants from '../../../core/Constants';
-
-const SUPPORTED_STATES = ['LabelsModel', 'HyperTextLabelsModel', 'RatingModel'];
 
 const WARNING_MESSAGES = {
   dataTypeMistmatch: () => 'Do not put text directly in task data if you use valueType=url.',
@@ -96,7 +94,7 @@ const Model = types
     activeStates() {
       const states = self.states();
 
-      return states ? states.filter(s => s.isSelected && SUPPORTED_STATES.includes(getType(s).name)) : null;
+      return states ? states.filter(s => s.isLabeling && s.isSelected) : null;
     },
 
     get isLoaded() {
@@ -222,7 +220,12 @@ const Model = types
 
         // clean up the html — remove scripts and iframes
         // nodes count better be the same, so replace them with stubs
-        self._value = sanitizeHtml(String(val), { useStub: true, useHeadStub: true });
+        // we should not sanitize text tasks because we already have htmlEscape in view.js
+        if (isFF(FF_SAFE_TEXT) && self.type === 'text') {
+          self._value = String(val);
+        } else {
+          self._value = sanitizeHtml(String(val));
+        }
 
         self._regionsCache.forEach(({ region, annotation }) => {
           region.setText(self._value.substring(region.startOffset, region.endOffset));

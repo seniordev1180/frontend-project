@@ -93,7 +93,22 @@ export class HtxTextBox extends React.Component {
   }, 100);
 
   renderEdit() {
-    const { className = '', rows = 1, onlyEdit, name, onFocus, onChange, ...props } = this.props;
+    const {
+      className = '',
+      rows = 1,
+      onlyEdit,
+      name,
+      onFocus,
+      onChange,
+
+      // don't pass non-DOM props to Paragraph
+      onDelete: _,
+      isEditable: __,
+      isDeleteable: ___,
+      ignoreShortcuts: ____,
+
+      ...props
+    } = this.props;
     const { height, value } = this.state;
 
     const inputProps = {
@@ -103,7 +118,7 @@ export class HtxTextBox extends React.Component {
       autoFocus: true,
       ref: this.inputRef,
       value,
-      onBlur: isFF(FF_DEV_1566) ? ()=>{
+      onBlur: isFF(FF_DEV_1566) ? () => {
         onChange(this.state.value);
       } : this.save,
       onFocus,
@@ -150,8 +165,11 @@ export class HtxTextBox extends React.Component {
       isEditable,
       isDeleteable,
       text,
+
+      // don't pass non-DOM props to Paragraph
       ignoreShortcuts: _,
       onlyEdit: __,
+
       ...props
     } = this.props;
 

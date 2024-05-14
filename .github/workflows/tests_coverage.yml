@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: "Checkout codebase"
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: "Download Unit coverage from Artifact"
         uses: ./.github/actions/download-artifact
@@ -25,7 +25,7 @@ jobs:
           name: unit-tests-coverage
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3.1.4
+        uses: codecov/codecov-action@v4.1.0
         if: ${{ !github.event.pull_request.head.repo.fork }}
         with:
           fail_ci_if_error: true
@@ -39,7 +39,7 @@ jobs:
 
     steps:
       - name: "Checkout codebase"
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: "Download E2E coverage from Artifact"
         uses: ./.github/actions/download-artifact
@@ -47,7 +47,7 @@ jobs:
           name: e2e-tests-coverage
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3.1.4
+        uses: codecov/codecov-action@v4.1.0
         if: ${{ !github.event.pull_request.head.repo.fork }}
         with:
           fail_ci_if_error: true
@@ -61,7 +61,7 @@ jobs:
 
     steps:
       - name: "Checkout codebase"
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: "Download Cypress coverage from Artifact"
         uses: ./.github/actions/download-artifact
@@ -69,7 +69,7 @@ jobs:
           name: cypress-tests-coverage
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3.1.4
+        uses: codecov/codecov-action@v4.1.0
         if: ${{ !github.event.pull_request.head.repo.fork }}
         with:
           fail_ci_if_error: true
