@@ -1,580 +1,920 @@
-import { FC, MutableRefObject, ReactNode } from 'react';
-import { clamp } from '../../../utils/utilities';
-import {
-  DEFAULT_PANEL_HEIGHT,
-  DEFAULT_PANEL_MAX_HEIGHT,
-  DEFAULT_PANEL_MAX_WIDTH,
-  DEFAULT_PANEL_MIN_HEIGHT,
-  DEFAULT_PANEL_WIDTH,
-  PANEL_HEADER_HEIGHT
-} from '../constants';
-import { Assist, Comments, History, Info, Relations } from '../DetailsPanel/DetailsPanel';
-import { OutlinerComponent } from '../OutlinerPanel/OutlinerPanel';
-import { PanelProps } from '../PanelBase';
-import { emptyPanel, JoinOrder, PanelBBox, PanelView, Side, ViewportSize } from './types';
+import React, { Component, createRef, forwardRef, Fragment, memo, useEffect, useRef, useState } from 'react';
+import { Group, Layer, Line, Rect, Stage } from 'react-konva';
+import { observer } from 'mobx-react';
+import { getEnv, getRoot, isAlive } from 'mobx-state-tree';
 
-export const determineLeftOrRight = (event: any, droppableElement?: ReactNode) => {
-  const element = droppableElement || event.target as HTMLElement;
-  const dropWidth = (element as HTMLElement).clientWidth as number;
-  const x = event.pageX as number - (element as HTMLElement).getBoundingClientRect().left;
-  const half = dropWidth / 2;
+import ImageGrid from '../ImageGrid/ImageGrid';
+import ImageTransformer from '../ImageTransformer/ImageTransformer';
+import ObjectTag from '../../components/Tags/Object';
+import Tree from '../../core/Tree';
+import styles from './ImageView.module.scss';
+import { errorBuilder } from '../../core/DataValidator/ConfigValidator';
+import { chunks, findClosestParent } from '../../utils/utilities';
+import Konva from 'konva';
+import { LoadingOutlined } from '@ant-design/icons';
+import { Toolbar } from '../Toolbar/Toolbar';
+import { ImageViewProvider } from './ImageViewContext';
+import { Hotkey } from '../../core/Hotkey';
+import { useObserver } from 'mobx-react';
+import ResizeObserver from '../../utils/resize-observer';
+import { debounce } from '../../utils/debounce';
+import Constants from '../../core/Constants';
+import { fixRectToFit } from '../../utils/image';
+import { FF_DEV_1285, FF_DEV_1442, FF_DEV_3077, FF_DEV_4081, isFF } from '../../utils/feature-flags';
 
-  return x > half ? Side.right : Side.left;
-};
+Konva.showWarnings = false;
 
-export const determineDroppableArea = (droppingElement: HTMLElement) => droppingElement?.id?.includes('droppable');
+const hotkeys = Hotkey('Image');
 
-export const stateRemovedTab = (state: Record<string, PanelBBox>, movingPanel: string, movingTab: number) => {
-  const newState = { ...state };
+const splitRegions = (regions) => {
+  const brushRegions = [];
+  const shapeRegions = [];
+  const l = regions.length;
+  let i = 0;
 
-  if (!newState[movingPanel]) return newState;
+  for (i; i < l; i++) {
+    const region = regions[i];
 
-  return {
-    ...newState,
-    [movingPanel]: {
-      ...newState[movingPanel],
-      panelViews: newState[movingPanel].panelViews.filter((_, tabIterator) => tabIterator !== movingTab),
-    },
-  };
-};
-
-export const setActive = (state: Record<string, PanelBBox>, key: string, tabIndex: number) => {
-  const newState = {
-    ...state, [key]: {
-      ...state[key], panelViews: state[key].panelViews.map((view, index) => {
-        view.active = index === tabIndex;
-        return view;
-      }),
-    },
-  };
-
-  return newState;
-};
-
-export const setActiveDefaults = (state: Record<string, PanelBBox>) => {
-  const newState = { ...state };
-
-  Object.keys(state).forEach((panelKey: string) => {
-    const firstActiveTab = newState[panelKey].panelViews.findIndex((view) => view.active) ;
-
-    newState[panelKey].panelViews[firstActiveTab > 0 ? firstActiveTab : 0].active = true;
-  });
-
-  return newState;
-};
-
-
-export const renameKeys = (state: Record<string, PanelBBox>) => {
-  const newState = {};
-
-  Object.keys(state).forEach((panelKey: string) => {
-    const newKey = `${state[panelKey].panelViews.map(view => view.name).join('-')}`;
-    const panel = { ...state[panelKey] };
-
-    Object.assign(newState, { [newKey]: panel });
-  });
-
-  return newState;
-};
-
-export const stateAddedTab = (
-  state: Record<string, PanelBBox>,
-  movingPanel: string,
-  receivingPanel: string,
-  movingTabData: PanelView,
-  receivingTab: number,
-  dropSide: Side,
-) => {
-  const newState = { ...state };
-  const panel = newState[receivingPanel];
-
-  panel.panelViews = newState[receivingPanel].panelViews.map((view) => {
-    view.active = false;
-    return view;
-  });
-
-  let index = receivingTab + (dropSide === Side.right ? 1 : 0);
-
-  if (movingPanel === receivingPanel && index > 0) index -= 1;
-  panel.panelViews.splice(index, 0, movingTabData);
-  return newState;
-};
-
-export const stateRemovePanelEmptyViews = (state: Record<string, PanelBBox>) => {
-  const newState = { ...state };
-
-  Object.keys(newState).forEach((panel) => {
-    if (newState[panel].panelViews.length === 0) delete newState[panel];
-  });
-  return newState;
-};
-
-export const panelComponents: {[key:string]: FC<PanelProps>} = {
-  'regions': OutlinerComponent as FC<PanelProps>,
-  'history': History as FC<PanelProps>,
-  'relations': Relations as FC<PanelProps>,
-  'comments': Comments as FC<PanelProps>,
-  'assist': Assist as FC<PanelProps>,
-  'info': Info as FC<PanelProps>,
-};
-
-const panelViews = [
-  {
-    name: 'regions',
-    title: 'Regions',
-    component: panelComponents['regions'] as FC<PanelProps>,
-    active: true,
-  },
-  {
-    name: 'history',
-    title: 'History',
-    component: panelComponents['history'] as FC<PanelProps>,
-    active: false,
-  },
-
-  {
-    name: 'relations',
-    title: 'Relations',
-    component: panelComponents['relations'] as FC<PanelProps>,
-    active: false,
-  },
-  {
-    name: 'info',
-    title: 'Info',
-    component: panelComponents['info'] as FC<PanelProps>,
-    active: true,
-  },
-  {
-    name: 'comments',
-    title: 'Comments',
-    component: panelComponents['comments'] as FC<PanelProps>,
-    active: false,
-  },
-  {
-    name: 'assist',
-    title: 'Assistant',
-    component: panelComponents['assist'] as FC<PanelProps>,
-    active: false,
-  },
-];
-
-export const enterprisePanelDefault: Record<string, PanelBBox> = {
-  'info-comments-history': {
-    order: 1,
-    top: 0,
-    left: 0,
-    relativeLeft: 0,
-    relativeTop: 0,
-    zIndex: 10,
-    width: DEFAULT_PANEL_WIDTH,
-    height: DEFAULT_PANEL_HEIGHT,
-    visible: true,
-    detached: false,
-    alignment: Side.right,
-    maxHeight: DEFAULT_PANEL_MAX_HEIGHT,
-    panelViews: [panelViews[3], panelViews[4], panelViews[1]],
-  },
-  'regions-relations': {
-    order: 2,
-    top: 0,
-    left: 0,
-    relativeLeft: 0,
-    relativeTop: 0,
-    zIndex: 10,
-    width: DEFAULT_PANEL_WIDTH,
-    height: DEFAULT_PANEL_HEIGHT,
-    visible: true,
-    detached: false,
-    alignment: Side.right,
-    maxHeight: DEFAULT_PANEL_MAX_HEIGHT,
-    panelViews: [panelViews[0], panelViews[2], panelViews[5]],
-  },
-};
-
-export const openSourcePanelDefault: Record<string, PanelBBox> = {
-  'info-history': {
-    order: 1,
-    top: 0,
-    left: 0,
-    relativeLeft: 0,
-    relativeTop: 0,
-    zIndex: 10,
-    width: DEFAULT_PANEL_WIDTH,
-    height: DEFAULT_PANEL_HEIGHT,
-    visible: true,
-    detached: false,
-    alignment: Side.right,
-    maxHeight: DEFAULT_PANEL_MAX_HEIGHT,
-    panelViews: [panelViews[3], panelViews[4], panelViews[1]],
-  },
-  'regions-relations': {
-    order: 2,
-    top: 0,
-    left: 0,
-    relativeLeft: 0,
-    relativeTop: 0,
-    zIndex: 10,
-    width: DEFAULT_PANEL_WIDTH,
-    height: DEFAULT_PANEL_HEIGHT,
-    visible: true,
-    detached: false,
-    alignment: Side.right,
-    maxHeight: DEFAULT_PANEL_MAX_HEIGHT,
-    panelViews: [panelViews[0], panelViews[2]],
-  },
-};
-
-export const partialEmptyBaseProps = {
-  ...emptyPanel,
-  name: 'breakpointCollapsed',
-  positioning: false,
-  height: DEFAULT_PANEL_HEIGHT,
-  maxHeight: DEFAULT_PANEL_HEIGHT,
-  detached: false,
-  maxWidth: DEFAULT_PANEL_MAX_WIDTH,
-  zIndex: 10,
-  expanded: true,
-  locked: true,
-  alignment: Side.left,
-  lockPanelContents: false,
-  attachedKeys: [],
-  sidePanelCollapsed: { [Side.left]: false, [Side.right]: false },
-  setSidePanelCollapsed: () => { },
-  dragTop: false,
-  dragBottom: false,
-  panelViews: [panelViews[0], panelViews[1], panelViews[2], panelViews[3], panelViews[4]],
-};
-
-export const resizers = [
-  'top-left',
-  'top-right',
-  'bottom-left',
-  'bottom-right',
-  'top',
-  'bottom',
-  'right',
-  'left',
-];
-
-
-export const checkCollapsedPanelsHaveData = (
-  collapsedSide: { [key: string]: boolean },
-  panelData: Record<string, PanelBBox>,
-) => {
-  const collapsedCopy = { ...collapsedSide };
-  const collapsedPanels = Object.keys(collapsedCopy).filter((side) => collapsedCopy[side]);
-
-  collapsedPanels.forEach((side) => {
-    const hasData = Object.keys(panelData).some((panel) => {
-      return panelData[panel].alignment === side && !panelData[panel].detached;
-    });
-
-    if (!hasData) collapsedCopy[side] = false;
-  });
-
-  return collapsedCopy;
-};
-
-export const restorePanel = (showComments: boolean) => {
-  const perviousState = window.localStorage.getItem('panelState');
-  const parsed = perviousState && JSON.parse(perviousState);
-  const panelData = parsed && parsed.panelData;
-  const defaultCollapsedSide = { [Side.left]: false, [Side.right]: false };
-  const collapsedSide = parsed?.collapsedSide ? parsed.collapsedSide : defaultCollapsedSide;
-
-  const allTabs =
-    panelData &&
-    Object.entries(panelData)
-      .map(([_, panel]: any) => panel.panelViews)
-      .flat(1);
-
-  if (!allTabs || allTabs.length !== (panelViews.length - (showComments ? 1 : 0))) {
-    const defaultPanel = showComments ? openSourcePanelDefault : enterprisePanelDefault;
-
-    return { panelData: defaultPanel, collapsedSide: defaultCollapsedSide };
+    if (region.type === 'brushregion') {
+      brushRegions.push(region);
+    } else {
+      shapeRegions.push(region);
+    }
   }
 
-  const noEmptyPanels = stateRemovePanelEmptyViews(panelData);
-  const withActiveDefaults = setActiveDefaults(noEmptyPanels);
-  const safeCollapsedSide = checkCollapsedPanelsHaveData(collapsedSide, withActiveDefaults) as { [Side.left]: boolean, [Side.right]: boolean };
-
-  return { panelData: restoreComponentsToState(withActiveDefaults), collapsedSide: safeCollapsedSide };
-};
-
-export const restoreComponentsToState = (panelData: Record<string, PanelBBox>) => {
-  const updatedPanels: any = { ...panelData };
-  
-  Object.keys(updatedPanels).forEach(panelName => {
-    const panel = updatedPanels[panelName];
-
-    panel.panelViews.forEach((view: { name: string, component: FC<PanelProps> }) => {
-      view.component = panelComponents[view.name];
-    });
-  });
-
-  return updatedPanels; 
-};
-
-export const savePanels = (panelData: Record<string, PanelBBox>, collapsedSide: { [Side.left]: boolean, [Side.right]: boolean }) => {
-  window.localStorage.setItem('panelState', JSON.stringify({ panelData, collapsedSide }));
-};
-
-export const getLeftKeys = (state: Record<string, PanelBBox>) => Object.keys(state).filter((key) => !state[key].detached && state[key].alignment === Side.left);
-export const getRightKeys = (state: Record<string, PanelBBox>) => Object.keys(state).filter((key) => !state[key].detached && state[key].alignment === Side.right);
-
-export const getAttachedPerSide = (state: Record<string, PanelBBox>, side: string) => {
-  if (side === Side.left) return getLeftKeys(state).sort((a, b) => state[a].order - state[b].order);
-  if (side === Side.right) return getRightKeys(state).sort((a, b) => state[a].order - state[b].order);
-};
-
-export const getSnappedHeights = (
-  state: Record<string, PanelBBox>,
-  totalHeight: number,
-) => {
-  const newState = { ...state };
-  const leftKeys = getLeftKeys(newState);
-  const rightKeys = getRightKeys(newState);
-
-  [leftKeys, rightKeys].forEach((list) => {
-    const totalCollapsed = list.filter(panelKey => !state[panelKey].visible).length;
-    const visible = list.filter(panelKey => state[panelKey].visible);
-    const collapsedAdjustments = PANEL_HEADER_HEIGHT * totalCollapsed;
-    const visibleGroupHeight = visible.reduce((acc, key) => acc + newState[key].height, 0);
-    const visibleGroupDifference = totalHeight - collapsedAdjustments - visibleGroupHeight;
-    const negativeNumber = visibleGroupDifference < 0;
-    const adjustment = Math.abs(visibleGroupDifference) / (visible.length || 1);
-    let top = 0;
-    
-    visible.forEach(panelKey => {
-      const newHeight = negativeNumber
-        ? newState[panelKey].height - adjustment
-        : newState[panelKey].height + adjustment;
-
-      if (newState[panelKey].visible) {
-        newState[panelKey].height = newHeight;
-        newState[panelKey].top = top;
-        top += newHeight;
-      } else top += PANEL_HEADER_HEIGHT;
-    });
-  });
-
-  return newState ;
-};
-
-export const redistributeHeights = (
-  state: Record<string, PanelBBox>,
-  totalHeight: number,
-  alignment: Side,
-) => {
-  const newState = { ...state };
-  const sideKeys = getAttachedPerSide(newState, alignment);
-
-  if (!sideKeys?.length) return state;
-  const visible = sideKeys.filter(panelKey => newState[panelKey].visible);
-  const totalCollapsed = sideKeys.filter(panelKey => !newState[panelKey].visible).length;
-  const collapsedAdjustments = PANEL_HEADER_HEIGHT * totalCollapsed;
-  const distributedHeight = (totalHeight - collapsedAdjustments) / visible.length || 1;
-
-  visible.forEach(panelKey => {
-    let top = 0;
-
-    if (newState[panelKey].visible) {
-      newState[panelKey].height = distributedHeight;
-      newState[panelKey].top = top;
-      top += distributedHeight;
-    } else top += PANEL_HEADER_HEIGHT;
-  });
-
-  return newState;
-};
-
-const setOrder = (state: Record<string, PanelBBox>, panelAddKey: string, columnsToOrder: string[], order: JoinOrder) => {
-  const newState = { ...state };
-
-  newState[panelAddKey].order = order === JoinOrder.top ? 0 : columnsToOrder.length;
-  let orderCounter = order === JoinOrder.bottom ? 0 : 1;
-
-  columnsToOrder.forEach((panelKey) => {
-    if (panelAddKey === panelKey) return;
-    newState[panelKey].order = orderCounter;
-    orderCounter += 1;
-  });
-
-  return newState;
-};
-
-export const joinPanelColumns = (
-  state: Record<string, PanelBBox>,
-  panelAddKey: string,
-  alignment: Side,
-  width: number,
-  totalHeight: number,
-  order: JoinOrder = JoinOrder.bottom,
-): Record<string, PanelBBox> => {
-  const newState = { ...state };
-  const columns = getAttachedPerSide(newState, alignment);
-
-  const newWidth = !columns ? width || DEFAULT_PANEL_WIDTH : columns.reduce((acc, key) => {
-    if (acc < state[key].width) return state[key].width;
-    return acc;
-  }, 0) || width;
-  
-  const addedPanel = {
-    ...newState, [panelAddKey]: {
-      ...newState[panelAddKey],
-      width: newWidth,
-      alignment,
-      detached: false,
-    },
+  return {
+    brushRegions,
+    shapeRegions,
   };
-  const newColumns = getAttachedPerSide(addedPanel, alignment) as string[];
-  const orderedState = setOrder(addedPanel, panelAddKey, newColumns, order);
-  const adjustZIndex = findZIndices(orderedState, panelAddKey);
-
-  return redistributeHeights(adjustZIndex, totalHeight, alignment);
 };
 
-export const splitPanelColumns = (
-  state: Record<string, PanelBBox>,
-  removingKey: string,
-  totalHeight: number,
-) => {
-  const newState = { ...state };
-  const alignment = newState[removingKey].alignment as Side;
-  const movingTabAttributes = {
-    width: DEFAULT_PANEL_WIDTH,
-    detached: true,
-    height: DEFAULT_PANEL_HEIGHT,
-  };
-  const removedState = { ...newState, [removingKey]: { ...newState[removingKey], ...movingTabAttributes } };
-  const column = getAttachedPerSide(newState, alignment);
-
-  column?.forEach((key, index) => { newState[key].order = index; });
-  return redistributeHeights(removedState, totalHeight, alignment);
-};
-
-export const resizePanelColumns = (
-  state: Record<string, PanelBBox>,
-  key: string,
-  height: number,
-  top: number,
-  availableHeight: number,
-) => {
-  const newState = { ...state };
-  const panelsOnSameAlignment = getAttachedPerSide(newState, newState[key]?.alignment as Side);
-  const maxHeight = availableHeight;
-
-  if (!panelsOnSameAlignment) return state;
-  const difference = (height - newState[key].height);
-  const visiblePanels = panelsOnSameAlignment.filter((panelKey) => newState[panelKey].visible);
-  const panelAboveKeyIndex = visiblePanels?.findIndex((visibleKey) => visibleKey === key) - 1;
-  
-  if (panelAboveKeyIndex === undefined) return state;
-
-  const panelAboveKey = visiblePanels[panelAboveKeyIndex];
-
-  panelsOnSameAlignment.forEach((panelKey) => {
-    let newHeight = newState[panelKey].height;
-
-    if (panelKey === key) newHeight = height;
-    if (panelKey === panelAboveKey) newHeight = newHeight - difference;
-    if (height <= DEFAULT_PANEL_MIN_HEIGHT) height = DEFAULT_PANEL_MIN_HEIGHT;
-    if (!newState[panelKey].visible) return;
-
-    newState[panelKey] = {
-      ...newState[panelKey],
-      relativeTop: (top / availableHeight) * 100,
-      storedLeft: undefined,
-      storedTop: undefined,
-      maxHeight,
-      height: clamp(newHeight, DEFAULT_PANEL_MIN_HEIGHT, availableHeight),
-    };
-  });
-  const collapsedAdjustments = panelsOnSameAlignment
-    .filter(panelKey => !newState[panelKey].visible).length * PANEL_HEADER_HEIGHT;
-  const totalHeight = panelsOnSameAlignment
-    .filter(panelKey => newState[panelKey].visible)
-    .reduce((acc, panelKey) => acc + newState[panelKey].height, 0);
-  
-  if (totalHeight + collapsedAdjustments > availableHeight) return getSnappedHeights(state, availableHeight);
-  return getSnappedHeights(newState, availableHeight);
-};
-
-export const newPanelFromTab = (
-  state: Record<string, PanelBBox>,
-  name: string,
-  movingPanel: string,
-  movingTab: number,
-  left: number,
-  top: number,
-  viewportSize: MutableRefObject<ViewportSize>,
-) => ({
-  ...emptyPanel,
-  name,
-  panelViews: [{ ...state[movingPanel].panelViews[movingTab], active: true }],
-  top,
-  left,
-  relativeTop: (top / viewportSize.current.height) * 100,
-  relativeLeft: (left / viewportSize.current.width) * 100,
-  visible: true,
-  detached: true,
-  zIndex: 12,
+const Region = memo(({ region, showSelected = false }) => {
+  return useObserver(() => region.inSelection !== showSelected ? null : Tree.renderItem(region, region.annotation, false));
 });
 
-export const newPanelInState = (
-  state: Record<string, PanelBBox>,
-  name: string,
-  movingPanel: string,
-  movingTab: number,
-  left: number,
-  top: number,
-  viewportSize: MutableRefObject<ViewportSize>,
-) => {
-  const newPanel = newPanelFromTab(state, name, movingPanel, movingTab, left, top, viewportSize);
-  const stateWithRemovals = stateRemovedTab(state, movingPanel, movingTab);
-  const panelsWithRemovals = stateRemovePanelEmptyViews(stateWithRemovals);
-  const panelWithAdditions = { ...panelsWithRemovals, [`${newPanel.name}`]: newPanel };
-  const renamedKeys = renameKeys(panelWithAdditions);
-  const activeDefaults = setActiveDefaults(renamedKeys);
-  const adjustZIndex = findZIndices(activeDefaults, newPanel.name);
+const RegionsLayer = memo(({ regions, name, useLayers, showSelected = false }) => {
+  const content = regions.map((el) => (
+    <Region key={`region-${el.id}`} region={el} showSelected={showSelected} />
+  ));
 
-  return getSnappedHeights(adjustZIndex, viewportSize.current.height);
-};
-
-const partitionByAttached = (state: Record<string, PanelBBox>) => {
-  return Object.keys(state).reduce(
-    (result: [{ zIndex: number, panelKey: string }[], { zIndex: number, panelKey: string }[]], panelKey) => {
-      state[panelKey].detached
-        ? result[0].push({ zIndex: state[panelKey].zIndex, panelKey })
-        : result[1].push({ zIndex: state[panelKey].zIndex, panelKey });
-
-      return result;
-    },
-    [[], []],
+  return useLayers === false ? (
+    content
+  ) : (
+    <Layer name={name}>
+      {content}
+    </Layer>
   );
-};
+});
 
-export const findZIndices = (state: Record<string, PanelBBox>, focusedKey: string) => {
-  const newState = { ...state };
-  const [detached, attached] = partitionByAttached(newState);
+const Regions = memo(({ regions, useLayers = true, chunkSize = 15, suggestion = false, showSelected = false }) => {
+  return (
+    <ImageViewProvider value={{ suggestion }}>
+      {(chunkSize ? chunks(regions, chunkSize) : regions).map((chunk, i) => (
+        <RegionsLayer
+          key={`chunk-${i}`}
+          name={`chunk-${i}`}
+          regions={chunk}
+          useLayers={useLayers}
+          showSelected={showSelected}
+        />
+      ))}
+    </ImageViewProvider>
+  );
+});
 
-  let detachedCounter = 12;
+const DrawingRegion = observer(({ item }) => {
+  const { drawingRegion } = item;
+  const Wrapper = drawingRegion && drawingRegion.type === 'brushregion' ? Fragment : Layer;
 
-  attached.forEach(panel => (newState[panel.panelKey].zIndex = 10));
-  detached
-    .sort((a, b) => a.zIndex - b.zIndex)
-    .forEach(panel => {
-      newState[panel.panelKey].zIndex = detachedCounter;
-      detachedCounter++;
-    });
-  if (newState[focusedKey].detached) newState[focusedKey].zIndex = detached.length + 12;
+  return (
+    <Wrapper>
+      {drawingRegion ? <Region key={'drawing'} region={drawingRegion} /> : drawingRegion}
+    </Wrapper>
+  );
+});
 
-  return newState;
-};
+const SELECTION_COLOR = '#40A9FF';
+const SELECTION_SECOND_COLOR = 'white';
+const SELECTION_DASH = [3, 3];
 
-export const findPanelViewByName = (state: Record<string, PanelBBox>, name: string): { panelName: string, tab: PanelView, panelViewIndex: number } | undefined => {
-  const panelName = Object.keys(state).find(panelKey => panelKey.includes(name)) || '';
-  const panelViewIndex = state[panelName]?.panelViews.findIndex((view: { name: string }) => view.name === name);
+const SelectionBorders = observer(({ item, selectionArea }) => {
+  const { selectionBorders: bbox } = selectionArea;
 
-  return panelViewIndex >= 0 ? { panelName, tab: state[panelName].panelViews[panelViewIndex], panelViewIndex } : undefined;
-};
+  bbox.left = bbox.left * item.stageScale;
+  bbox.right = bbox.right * item.stageScale;
+  bbox.top = bbox.top * item.stageScale ;
+  bbox.bottom = bbox.bottom * item.stageScale ;
+
+  const points = bbox ? [
+    {
+      x: bbox.left,
+      y: bbox.top,
+    },
+    {
+      x: bbox.right,
+      y: bbox.top,
+    },
+    {
+      x: bbox.left,
+      y: bbox.bottom,
+    },
+    {
+      x: bbox.right,
+      y: bbox.bottom,
+    },
+  ] : [];
+
+  return (
+    <>
+      {bbox && (
+        <Rect
+          name="regions_selection"
+          x={bbox.left}
+          y={bbox.top}
+          width={bbox.right - bbox.left}
+          height={bbox.bottom - bbox.top}
+          stroke={SELECTION_COLOR}
+          strokeWidth={1}
+          listening={false}
+        />
+      )}
+      {points.map((point, idx) => {
+        return (
+          <Rect
+            key={idx}
+            x={point.x - 3}
+            y={point.y - 3}
+            width={6}
+            height={6}
+            fill={SELECTION_COLOR}
+            stroke={SELECTION_SECOND_COLOR}
+            strokeWidth={2}
+            listening={false}
+          />
+        );
+      })}
+    </>
+  );
+});
+
+const SelectionRect = observer(({ item }) => {
+  const { x, y, width, height } = item;
+
+  const positionProps = {
+    x,
+    y,
+    width,
+    height,
+    listening: false,
+    strokeWidth: 1,
+  };
+
+  return (
+    <>
+      <Rect
+        {...positionProps}
+        stroke={SELECTION_COLOR}
+        dash={SELECTION_DASH}
+      />
+      <Rect
+        {...positionProps}
+        stroke={SELECTION_SECOND_COLOR}
+        dash={SELECTION_DASH}
+        dashOffset={SELECTION_DASH[0]}
+      />
+    </>
+  );
+});
+
+const TRANSFORMER_BACK_ID = 'transformer_back';
+
+const TransformerBack = observer(({ item }) => {
+  const { selectedRegionsBBox } = item;
+  const singleNodeMode = item.selectedRegions.length === 1;
+  const dragStartPointRef = useRef({ x: 0, y: 0 });
+
+  return (
+    <Layer>
+      {selectedRegionsBBox && !singleNodeMode && (
+        <Rect
+          id={TRANSFORMER_BACK_ID}
+          fill="rgba(0,0,0,0)"
+          draggable
+          onClick={()=>{
+            item.annotation.unselectAreas();
+          }}
+          onMouseOver={(ev) => {
+            if (!item.annotation.relationMode) {
+              ev.target.getStage().container().style.cursor = Constants.POINTER_CURSOR;
+            }
+          }}
+          onMouseOut={(ev) => {
+            ev.target.getStage().container().style.cursor = Constants.DEFAULT_CURSOR;
+          }}
+          onDragStart={e=>{
+            dragStartPointRef.current = {
+              x: e.target.getAttr('x'),
+              y: e.target.getAttr('y'),
+            };
+          }}
+          dragBoundFunc={(pos) => {
+            let { x, y } = pos;
+            const { top, left, right, bottom } =  item.selectedRegionsBBox;
+            const { stageHeight, stageWidth } = item;
+
+            const offset = {
+              x: dragStartPointRef.current.x-left,
+              y: dragStartPointRef.current.y-top,
+            };
+
+            x -=offset.x;
+            y -=offset.y;
+
+            const bbox = { x, y, width: right - left, height: bottom  - top };
+
+            const fixed = fixRectToFit(bbox, stageWidth, stageHeight);
+
+            if (fixed.width !== bbox.width) {
+              x += (fixed.width - bbox.width) * (fixed.x !== bbox.x ? -1 : 1);
+            }
+
+            if (fixed.height !== bbox.height) {
+              y += (fixed.height - bbox.height) * (fixed.y !== bbox.y ? -1 : 1);
+            }
+
+            x +=offset.x;
+            y +=offset.y;
+            return { x, y };
+          }}
+        />
+      )}
+    </Layer>
+  );
+});
+
+const SelectedRegions = observer(({ item, selectedRegions }) => {
+  if (!selectedRegions) return null;
+  const { brushRegions = [], shapeRegions = [] } = splitRegions(selectedRegions);
+
+  return (
+    <>
+      <TransformerBack item={item}/>
+      {brushRegions.length > 0 && (
+        <Regions
+          key="brushes"
+          name="brushes"
+          regions={brushRegions}
+          useLayers={false}
+          showSelected
+          chankSize={0}
+        />
+      )}
+
+      {shapeRegions.length > 0 && (
+        <Regions
+          key="shapes"
+          name="shapes"
+          regions={shapeRegions}
+          showSelected
+          chankSize={0}
+        />
+      )}
+    </>
+  );
+});
+
+const SelectionLayer = observer(({ item, selectionArea }) => {
+
+  const scale = 1 / (item.zoomScale || 1);
+
+  const [isMouseWheelClick, setIsMouseWheelClick] = useState(false);
+  const [shift, setShift] = useState(false);
+  const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === 'ZoomPanTool';
+
+  const dragHandler = (e) => setIsMouseWheelClick(e.buttons === 4);
+
+  const handleKey = (e) => setShift(e.shiftKey);
+
+  useEffect(()=>{
+    window.addEventListener('keydown', handleKey);
+    window.addEventListener('keyup', handleKey);
+    window.addEventListener('mousedown', dragHandler);
+    window.addEventListener('mouseup', dragHandler);
+    return () => {
+      window.removeEventListener('keydown', handleKey);
+      window.removeEventListener('keyup', handleKey);
+      window.removeEventListener('mousedown', dragHandler);
+      window.removeEventListener('mouseup', dragHandler);
+    };
+  },[]);
+
+  const disableTransform = item.zoomScale > 1 && (shift || isPanTool || isMouseWheelClick);
+
+  let supportsTransform = true;
+  let supportsRotate = true;
+  let supportsScale = true;
+
+  item.selectedRegions?.forEach(shape => {
+    supportsTransform = supportsTransform && shape.supportsTransform === true;
+    supportsRotate = supportsRotate && shape.canRotate === true;
+    supportsScale = supportsScale && true;
+  });
+
+  supportsTransform =
+    supportsTransform &&
+    (item.selectedRegions.length > 1 ||
+      ((item.useTransformer || item.selectedShape?.preferTransformer) && item.selectedShape?.useTransformer));
+
+  return (
+    <Layer scaleX={scale} scaleY={scale}>
+      {selectionArea.isActive ? (
+        <SelectionRect item={selectionArea} />
+      ) : !supportsTransform && item.selectedRegions.length > 1 ? (
+        <SelectionBorders item={item} selectionArea={selectionArea} />
+      ) : null}
+      <ImageTransformer
+        item={item}
+        rotateEnabled={supportsRotate}
+        supportsTransform={!disableTransform && supportsTransform}
+        supportsScale={supportsScale}
+        selectedShapes={item.selectedRegions}
+        singleNodeMode={item.selectedRegions.length === 1}
+        useSingleNodeRotation={item.selectedRegions.length === 1 && supportsRotate}
+        draggableBackgroundSelector={`#${TRANSFORMER_BACK_ID}`}
+      />
+    </Layer>
+  );
+});
+
+const Selection = observer(({ item, selectionArea }) => {
+
+  return (
+    <>
+      <SelectedRegions key="selected-regions" item={item} selectedRegions={item.selectedRegions} />
+      <SelectionLayer item={item} selectionArea={selectionArea}/>
+    </>
+  );
+});
+
+const Crosshair = memo(forwardRef(({ width, height }, ref) => {
+  const [pointsV, setPointsV] = useState([50, 0, 50, height]);
+  const [pointsH, setPointsH] = useState([0, 100, width, 100]);
+  const [x, setX] = useState(100);
+  const [y, setY] = useState(50);
+
+  const [visible, setVisible] = useState(false);
+  const strokeWidth = 1;
+  const dashStyle = [3, 3];
+  let enableStrokeScale = true;
+
+  if (isFF(FF_DEV_1285)) {
+    enableStrokeScale = false;
+  }
+
+  if (ref) {
+    ref.current = {
+      updatePointer(newX, newY) {
+        if (newX !== x) {
+          setX(newX);
+          setPointsV([newX, 0, newX, height]);
+        }
+
+        if (newY !== y) {
+          setY(newY);
+          setPointsH([0, newY, width, newY]);
+        }
+      },
+      updateVisibility(visibility) {
+        setVisible(visibility);
+      },
+    };
+  }
+
+  return (
+    <Layer
+      name="crosshair"
+      listening={false}
+      opacity={visible ? 0.6 : 0}
+    >
+      <Group>
+        <Line
+          name="v-white"
+          points={pointsH}
+          stroke="#fff"
+
+        />
+        <Line
+          name="v-black"
+          points={pointsH}
+          stroke="#000"
+          strokeWidth={strokeWidth}
+          dash={dashStyle}
+
+        />
+      </Group>
+      <Group>
+        <Line
+          name="h-white"
+          points={pointsV}
+          stroke="#fff"
+          strokeWidth={strokeWidth}
+
+        />
+        <Line
+          name="h-black"
+          points={pointsV}
+          stroke="#000"
+          strokeWidth={strokeWidth}
+          dash={dashStyle}
+
+        />
+      </Group>
+    </Layer>
+  );
+}));
+
+export default observer(
+  class ImageView extends Component {
+    // stored position of canvas before creating region
+    canvasX;
+    canvasY;
+    lastOffsetWidth = -1;
+    lastOffsetHeight = -1;
+    state = {
+      imgStyle: {},
+      pointer: [0, 0],
+    };
+
+    imageRef = createRef();
+    crosshairRef = createRef();
+    handleDeferredMouseDown = null;
+    deferredClickTimeout = [];
+    skipMouseUp = false;
+
+    constructor(props) {
+      super(props);
+
+      if (typeof props.item.smoothing === 'boolean')
+        props.store.settings.setSmoothing(props.item.smoothing);
+    }
+
+    handleOnClick = e => {
+      const { item } = this.props;
+
+      if (isFF(FF_DEV_1442)) {
+        this.handleDeferredMouseDown?.();
+      }
+      if (this.skipMouseUp) {
+        this.skipMouseUp = false;
+        return;
+      }
+
+      const evt = e.evt || e;
+
+      return item.event('click', evt, evt.offsetX, evt.offsetY);
+    };
+
+    resetDeferredClickTimeout = () => {
+      if (this.deferredClickTimeout.length > 0) {
+        this.deferredClickTimeout = this.deferredClickTimeout.filter((timeout) => {
+          clearTimeout(timeout);
+          return false;
+        });
+      }
+    };
+
+    handleDeferredClick = (handleDeferredMouseDownCallback, handleDeselection, eligibleToDeselect = false) => {
+      this.handleDeferredMouseDown = () => {
+        if (eligibleToDeselect) {
+          handleDeselection();
+        }
+        handleDeferredMouseDownCallback();
+      };
+      this.resetDeferredClickTimeout();
+      this.deferredClickTimeout.push(setTimeout(() => {
+        this.handleDeferredMouseDown?.();
+      }, this.props.item.annotation.isDrawing ? 0 : 100));
+    };
+
+    handleMouseDown = e => {
+      const { item } = this.props;
+      const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === 'ZoomPanTool';
+
+      item.updateSkipInteractions(e);
+
+      const p = e.target.getParent();
+
+      if (!item.annotation.editable && !isPanTool) return;
+      if (p && p.className === 'Transformer') return;
+
+      const handleMouseDown = () => {
+        if (
+        // create regions over another regions with Cmd/Ctrl pressed
+          item.getSkipInteractions() ||
+          e.target === item.stageRef ||
+          findClosestParent(
+            e.target,
+            el => el.nodeType === 'Group' && ['ruler', 'segmentation'].indexOf(el?.attrs?.name) > -1,
+          )
+        ) {
+          window.addEventListener('mousemove', this.handleGlobalMouseMove);
+          window.addEventListener('mouseup', this.handleGlobalMouseUp);
+          const { offsetX: x, offsetY: y } = e.evt;
+          // store the canvas coords for calculations in further events
+          const { left, top } = item.containerRef.getBoundingClientRect();
+
+          this.canvasX = left;
+          this.canvasY = top;
+          item.event('mousedown', e, x, y);
+
+          return true;
+        }
+      };
+
+      const selectedTool = item.getToolsManager().findSelectedTool();
+      const eligibleToolForDeselect = [
+        undefined,
+        'EllipseTool',
+        'EllipseTool-dynamic',
+        'RectangleTool',
+        'RectangleTool-dynamic',
+        'PolygonTool',
+        'PolygonTool-dynamic',
+        'Rectangle3PointTool',
+        'Rectangle3PointTool-dynamic',
+      ].includes(selectedTool?.fullName);
+
+      if (isFF(FF_DEV_1442) && eligibleToolForDeselect) {
+        const targetIsCanvas = e.target === item.stageRef;
+        const annotationHasSelectedRegions = item.annotation.selectedRegions.length > 0;
+        const eligibleToDeselect = targetIsCanvas && annotationHasSelectedRegions;
+
+        const handleDeselection = () => {
+          item.annotation.unselectAll();
+          this.skipMouseUp = true;
+        };
+
+        this.handleDeferredClick(handleMouseDown, handleDeselection, eligibleToDeselect);
+        return;
+      }
+
+      const result = handleMouseDown();
+
+      if (result) return result;
+
+      return true;
+    };
+
+    /**
+     * Mouse up outside the canvas
+     */
+    handleGlobalMouseUp = e => {
+      window.removeEventListener('mousemove', this.handleGlobalMouseMove);
+      window.removeEventListener('mouseup', this.handleGlobalMouseUp);
+
+      if (e.target && e.target.tagName === 'CANVAS') return;
+
+      const { item } = this.props;
+      const { clientX: x, clientY: y } = e;
+
+      item.freezeHistory();
+
+      return item.event('mouseup', e, x - this.canvasX, y - this.canvasY);
+    };
+
+    handleGlobalMouseMove = e => {
+      if (e.target && e.target.tagName === 'CANVAS') return;
+
+      const { item } = this.props;
+      const { clientX: x, clientY: y } = e;
+
+      return item.event('mousemove', e, x - this.canvasX, y - this.canvasY);
+    };
+
+    /**
+     * Mouse up on Stage
+     */
+    handleMouseUp = e => {
+      const { item } = this.props;
+
+      if (isFF(FF_DEV_1442)) {
+        this.resetDeferredClickTimeout();
+      }
+
+      item.freezeHistory();
+      item.setSkipInteractions(false);
+
+      return item.event('mouseup', e, e.evt.offsetX, e.evt.offsetY);
+    };
+
+    handleMouseMove = e => {
+      const { item } = this.props;
+
+      item.freezeHistory();
+
+      this.updateCrosshair(e);
+
+      const isMouseWheelClick = e.evt && e.evt.buttons === 4;
+      const isDragging = e.evt && e.evt.buttons === 1;
+      const isShiftDrag = isDragging && e.evt.shiftKey;
+
+      if (isFF(FF_DEV_1442) && isDragging) {
+        this.resetDeferredClickTimeout();
+        this.handleDeferredMouseDown?.();
+      }
+
+      if ((isMouseWheelClick || isShiftDrag) && item.zoomScale > 1) {
+        item.setSkipInteractions(true);
+        e.evt.preventDefault();
+
+        const newPos = {
+          x: item.zoomingPositionX + e.evt.movementX,
+          y: item.zoomingPositionY + e.evt.movementY,
+        };
+
+        item.setZoomPosition(newPos.x, newPos.y);
+      } else {
+        item.event('mousemove', e, e.evt.offsetX, e.evt.offsetY);
+      }
+    };
+
+    updateCrosshair = (e) => {
+      if (this.crosshairRef.current) {
+        const { x, y } = e.currentTarget.getPointerPosition();
+
+
+      }
+    };
+
+    handleError = () => {
+      const { item, store } = this.props;
+      const cs = store.annotationStore;
+      const message = getEnv(store).messages.ERR_LOADING_HTTP({ attr: item.value, error: '', url: item._value });
+
+      cs.addErrors([errorBuilder.generalError(message)]);
+    };
+
+    updateGridSize = range => {
+      const { item } = this.props;
+
+      item.freezeHistory();
+
+      item.setGridSize(range);
+    };
+
+    /**
+     * Handle to zoom
+     */
+    handleZoom = e => {
+      /**
+       * Disable if user doesn't use ctrl
+       */
+      if (e.evt && !e.evt.ctrlKey) {
+        return;
+      } else if (e.evt && e.evt.ctrlKey) {
+        /**
+         * Disable scrolling page
+         */
+        e.evt.preventDefault();
+      }
+      if (e.evt) {
+        const { item } = this.props;
+        const stage = item.stageRef;
+
+        item.handleZoom(e.evt.deltaY, stage.getPointerPosition());
+      }
+    };
+
+    renderRulers() {
+      const { item } = this.props;
+      const width = 1;
+      const color = 'white';
+
+      return (
+        <Group
+          name="ruler"
+          onClick={ev => {
+            ev.cancelBubble = false;
+          }}
+        >
+          <Line
+            x={0}
+            y={item.cursorPositionY}
+            points={[0, 0, item.stageWidth, 0]}
+            strokeWidth={width}
+            stroke={color}
+            tension={0}
+            dash={[4, 4]}
+            closed
+          />
+          <Line
+            x={item.cursorPositionX}
+            y={0}
+            points={[0, 0, 0, item.stageHeight]}
+            strokeWidth={width}
+            stroke={color}
+            tension={0}
+            dash={[1.5]}
+            closed
+          />
+        </Group>
+      );
+    }
+
+    onResize = debounce(() => {
+      if (!this?.props?.item?.containerRef) return;
+      const { offsetWidth, offsetHeight } = this.props.item.containerRef;
+
+      if (this.props.item.naturalWidth <= 1) return;
+      if (this.lastOffsetWidth === offsetWidth && this.lastOffsetHeight === offsetHeight) return;
+
+      this.props.item.onResize(offsetWidth, offsetHeight, true);
+      this.lastOffsetWidth = offsetWidth;
+      this.lastOffsetHeight = offsetHeight;
+    }, 16);
+
+    componentDidMount() {
+      const { item } = this.props;
+
+      window.addEventListener('resize', this.onResize);
+      this.attachObserver(item.containerRef);
+      this.updateReadyStatus();
+
+      hotkeys.addDescription('shift', 'Pan image');
+    }
+
+    attachObserver = (node) => {
+      if (this.resizeObserver) this.detachObserver();
+
+      if (node) {
+        this.resizeObserver = new ResizeObserver(this.onResize);
+        this.resizeObserver.observe(node);
+      }
+    };
+
+    detachObserver = () => {
+      if (this.resizeObserver) {
+        this.resizeObserver.disconnect();
+        this.resizeObserver = null;
+      }
+    };
+
+    componentWillUnmount() {
+      this.detachObserver();
+      window.removeEventListener('resize', this.onResize);
+
+      hotkeys.removeDescription('shift');
+    }
+
+    componentDidUpdate() {
+      this.onResize();
+      this.updateReadyStatus();
+    }
+
+    updateReadyStatus() {
+      const { item } = this.props;
+      const { imageRef } = this;
+
+      if (!item || !isAlive(item) || !imageRef.current) return;
+      if (item.isReady !== imageRef.current.complete) item.setReady(imageRef.current.complete);
+    }
+
+    renderTools() {
+      const { item, store } = this.props;
+      const cs = store.annotationStore;
+
+      if (cs.viewingAllAnnotations || cs.viewingAllPredictions) return null;
+
+      const tools = item.getToolsManager().allTools();
+
+      return (
+        <Toolbar tools={tools} />
+      );
+    }
+
+    render() {
+
+      const { item, store } = this.props;
+
+      // @todo stupid but required check for `resetState()`
+      // when Image tries to render itself after detouching
+      if (!isAlive(item)) return null;
+
+      // TODO fix me
+      if (!store.task || !item._value) return null;
+
+      const regions = item.regs;
+
+      const containerStyle = {};
+
+      const containerClassName = styles.container;
+
+      if (getRoot(item).settings.fullscreen === false) {
+        containerStyle['maxWidth'] = item.maxwidth;
+        containerStyle['maxHeight'] = item.maxheight;
+        containerStyle['width'] = item.width;
+        containerStyle['height'] = item.height;
+      }
+
+      if (!this.props.store.settings.enableSmoothing && item.zoomScale > 1){
+        containerStyle['imageRendering'] = 'pixelated';
+      }
+
+      const imagePositionClassnames =  [
+        styles['image_position'],
+        styles[`image_position__${item.verticalalignment === 'center' ? 'middle' : item.verticalalignment}`],
+        styles[`image_position__${item.horizontalalignment}`],
+      ];
+
+      const wrapperClasses = [
+        styles.wrapperComponent,
+        item.images.length > 1 ? styles.withGallery : styles.wrapper,
+      ];
+
+      const {
+        brushRegions,
+        shapeRegions,
+      } = splitRegions(regions);
+
+      const {
+        brushRegions: suggestedBrushRegions,
+        shapeRegions: suggestedShapeRegions,
+      } = splitRegions(item.suggestions);
+
+      const renderableRegions = Object.entries({
+        brush: brushRegions,
+        shape: shapeRegions,
+        suggestedBrush: suggestedBrushRegions,
+        suggestedShape: suggestedShapeRegions,
+      });
+
+      return (
+        <ObjectTag
+          item={item}
+          className={wrapperClasses.join(' ')}
+        >
+          <div
+            ref={node => {
+              item.setContainerRef(node);
+              this.attachObserver(node);
+            }}
+            className={containerClassName}
+            style={containerStyle}
+          >
+            <div
+              ref={node => {
+                this.filler = node;
+              }}
+              className={styles.filler}
+              style={{ width: '100%', marginTop: item.fillerHeight }}
+            />
+            <div
+              className={[
+                styles.frame,
+                ...imagePositionClassnames,
+              ].join(' ')}
+              style={item.canvasSize}
+            >
+              <img
+                ref={ref => {
+                  item.setImageRef(ref);
+                  this.imageRef.current = ref;
+                }}
+                loading={(isFF(FF_DEV_3077) && !item.lazyoff) && 'lazy'}
+                style={item.imageTransform}
+                src={item._value}
+                onLoad={item.updateImageSize}
+                onError={this.handleError}
+                crossOrigin={item.imageCrossOrigin}
+                alt="LS"
+              />
+              {isFF(FF_DEV_4081)
+                ? (
+                  <canvas
+                    className={styles.overlay}
+                    ref={ref => {
+                      item.setOverlayRef(ref);
+                    }}
+                    style={item.imageTransform}
+                  />
+
+          {this.renderTools()}
+          {item.images.length > 1 && (
+            <div className={styles.gallery}>
+              {item.images.map((src, i) => (
+                <img
+                  alt=""
+                  key={src}
+                  src={src}
+                  className={i === item.currentImage && styles.active}
+                  height="60"
+                  onClick={() => item.setCurrentImage(i)}
+                />
+              ))}
+            </div>
+          )}
+        </ObjectTag>
+      );
+    }
+  },
+);
