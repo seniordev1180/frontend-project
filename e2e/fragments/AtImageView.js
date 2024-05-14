@@ -5,6 +5,7 @@ const Helpers = require('../tests/helpers');
 
 module.exports = {
   _stageSelector: '.konvajs-content',
+  _stageFrameSelector: '[class^="frame--"]',
   _stageBBox: null,
 
   _toolBarSelector: '.lsf-toolbar',
@@ -41,7 +42,7 @@ module.exports = {
   },
 
   async grabStageBBox() {
-    const bbox = await I.grabElementBoundingRect(this._stageSelector);
+    const bbox = await I.grabElementBoundingRect(this._stageFrameSelector);
 
     return bbox;
   },
@@ -76,6 +77,12 @@ module.exports = {
     I.say('Waiting for image to be loaded');
     await I.executeScript(Helpers.waitForImage);
     I.waitForVisible('canvas', 5);
+  },
+
+  async getNaturalSize() {
+    const sizes = await I.executeScript(Helpers.getNaturalSize);
+
+    return sizes;
   },
 
   async getCanvasSize() {

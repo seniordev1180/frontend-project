@@ -157,8 +157,8 @@ const Tab = ({
   );
 
   const Label = () => (
-    <Elem id={`${panelKey}_${tabIndex}_droppable`} name="tab" mod={{ active: locked ?  tabIndex === breakPointActiveTab : active }}>
-      {!locked && <Elem name="icon" tag={IconOutlinerDrag} width={20} />}
+    <Elem id={`${panelKey}_${tabIndex}_droppable`} name="tab" mod={{ active: locked ? tabIndex === breakPointActiveTab : active }}>
+      {!locked && <Elem name="icon" tag={IconOutlinerDrag} width={8} />}
       {tabText}
     </Elem>
   );
@@ -228,7 +228,7 @@ export const Tabs = (props: BaseProps) => {
             name="drop-space-after"
           />
         </Elem>
-        <Elem  name="contents">
+        <Elem name="contents">
           {ActiveComponent && <ActiveComponent {...props} />}
         </Elem>
       </Block>
