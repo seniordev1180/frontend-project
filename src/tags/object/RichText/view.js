@@ -1,767 +1,920 @@
-import React, { Component } from "react";
-import { htmlEscape, matchesSelector, moveStylesBetweenHeadTags } from "../../../utils/html";
-import ObjectTag from "../../../components/Tags/Object";
-import * as xpath from "xpath-range";
-import { inject, observer } from "mobx-react";
-import Utils from "../../../utils";
-import { fixCodePointsInRange, getSelectionText } from "../../../utils/selection-tools";
-import "./RichText.styl";
-import { isAlive } from "mobx-state-tree";
-import { LoadingOutlined } from "@ant-design/icons";
-import { Block, cn, Elem } from "../../../utils/bem";
-import { findGlobalOffset, findRangeNative } from "../../../utils/selection-tools";
-import { observe } from "mobx";
-import { FF_DEV_2786, isFF } from "../../../utils/feature-flags";
+import React, { Component, createRef, forwardRef, Fragment, memo, useEffect, useRef, useState } from 'react';
+import { Group, Layer, Line, Rect, Stage } from 'react-konva';
+import { observer } from 'mobx-react';
+import { getEnv, getRoot, isAlive } from 'mobx-state-tree';
 
-const DBLCLICK_TIMEOUT = 450; // ms
-const DBLCLICK_RANGE = 5; // px
+import ImageGrid from '../ImageGrid/ImageGrid';
+import ImageTransformer from '../ImageTransformer/ImageTransformer';
+import ObjectTag from '../../components/Tags/Object';
+import Tree from '../../core/Tree';
+import styles from './ImageView.module.scss';
+import { errorBuilder } from '../../core/DataValidator/ConfigValidator';
+import { chunks, findClosestParent } from '../../utils/utilities';
+import Konva from 'konva';
+import { LoadingOutlined } from '@ant-design/icons';
+import { Toolbar } from '../Toolbar/Toolbar';
+import { ImageViewProvider } from './ImageViewContext';
+import { Hotkey } from '../../core/Hotkey';
+import { useObserver } from 'mobx-react';
+import ResizeObserver from '../../utils/resize-observer';
+import { debounce } from '../../utils/debounce';
+import Constants from '../../core/Constants';
+import { fixRectToFit } from '../../utils/image';
+import { FF_DEV_1285, FF_DEV_1442, FF_DEV_3077, FF_DEV_4081, isFF } from '../../utils/feature-flags';
 
-class RichTextPieceView extends Component {
-  _regionSpanSelector = ".htx-highlight";
+Konva.showWarnings = false;
 
-  loadingRef = React.createRef();
+const hotkeys = Hotkey('Image');
 
-  // store value of first selected label during double click to apply it later
-  doubleClickSelection;
+const splitRegions = (regions) => {
+  const brushRegions = [];
+  const shapeRegions = [];
+  const l = regions.length;
+  let i = 0;
 
-  get isAbleToDragRegion() {
-    return Boolean(window.document.caretRangeFromPoint);
+  for (i; i < l; i++) {
+    const region = regions[i];
+
+    if (region.type === 'brushregion') {
+      brushRegions.push(region);
+    } else {
+      shapeRegions.push(region);
+    }
   }
 
-  _selectRegions = (additionalMode) => {
-    const { item } = this.props;
-    const root = item.visibleNodeRef.current;
-    const selection = window.getSelection();
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-    const regions = [];
-
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-
-      if (node.nodeName === "SPAN" && node.matches(this._regionSpanSelector) && selection.containsNode(node)) {
-        const region = this._determineRegion(node);
-
-        regions.push(region);
-      }
-    }
-    if (regions.length) {
-      item.annotation.extendSelectionWith(regions);
-      if (additionalMode) {
-        item.annotation.extendSelectionWith(regions);
-      } else {
-        item.annotation.selectAreas(regions);
-      }
-      selection.removeAllRanges();
-    }
+  return {
+    brushRegions,
+    shapeRegions,
   };
+};
 
-  _onMouseDown = (event) => {
-    const { item } = this.props;
-    const target = event.target;
-    const region = this._determineRegion(event.target);
+const Region = memo(({ region, showSelected = false }) => {
+  return useObserver(() => region.inSelection !== showSelected ? null : Tree.renderItem(region, region.annotation, false));
+});
 
-    if (isFF(FF_DEV_2786) && event.buttons === 1 && region?.selected) {
-      const doc = item.visibleDoc;
+const RegionsLayer = memo(({ regions, name, useLayers, showSelected = false }) => {
+  const content = regions.map((el) => (
+    <Region key={`region-${el.id}`} region={el} showSelected={showSelected} />
+  ));
 
-      item.isDragging = true;
-      this.draggableRegion = region;
-      this.dragAnchor = doc.caretRangeFromPoint(event.clientX, event.clientY);
-      const freezeSideLeft = target?.classList.contains('__resizeAreaRight');
-      const freezeSideRight = target?.classList.contains('__resizeAreaLeft');
-      const isEdge = freezeSideRight || freezeSideLeft;
+  return useLayers === false ? (
+    content
+  ) : (
+    <Layer name={name}>
+      {content}
+    </Layer>
+  );
+});
 
-      item.isFreezingEdge = isEdge && { left: freezeSideLeft, right: freezeSideRight };
-      item.isActive = isEdge || target?.classList.contains("__active");
-    }
-  };
+const Regions = memo(({ regions, useLayers = true, chunkSize = 15, suggestion = false, showSelected = false }) => {
+  return (
+    <ImageViewProvider value={{ suggestion }}>
+      {(chunkSize ? chunks(regions, chunkSize) : regions).map((chunk, i) => (
+        <RegionsLayer
+          key={`chunk-${i}`}
+          name={`chunk-${i}`}
+          regions={chunk}
+          useLayers={useLayers}
+          showSelected={showSelected}
+        />
+      ))}
+    </ImageViewProvider>
+  );
+});
 
-  _setSelectionStyle = (target, root, doc) => {
-    const styleMap = target.computedStyleMap();
-    const background = styleMap.get("background-color").toString();
-    const color = styleMap.get("color").toString();
+const DrawingRegion = observer(({ item }) => {
+  const { drawingRegion } = item;
+  const Wrapper = drawingRegion && drawingRegion.type === 'brushregion' ? Fragment : Layer;
 
-    const rules = [
-      `background: ${background};`,
-      `color: ${color};`,
-    ];
+  return (
+    <Wrapper>
+      {drawingRegion ? <Region key={'drawing'} region={drawingRegion} /> : drawingRegion}
+    </Wrapper>
+  );
+});
 
-    if (!this.selectionStyle) {
-      this.selectionStyle = doc.createElement("style");
-      // style tag in body changes its inner text, so only head!
-      root.ownerDocument.head.appendChild(this.selectionStyle);
-    }
+const SELECTION_COLOR = '#40A9FF';
+const SELECTION_SECOND_COLOR = 'white';
+const SELECTION_DASH = [3, 3];
 
-    this.selectionStyle.innerText = `::selection {${rules.join("\n")}}`;
-  }
+const SelectionBorders = observer(({ item, selectionArea }) => {
+  const { selectionBorders: bbox } = selectionArea;
 
-  _removeSelectionStyle = () => {
-    if (this.selectionStyle) this.selectionStyle.innerText = "";
-  }
+  bbox.left = bbox.left * item.stageScale;
+  bbox.right = bbox.right * item.stageScale;
+  bbox.top = bbox.top * item.stageScale ;
+  bbox.bottom = bbox.bottom * item.stageScale ;
 
-  _initializeDrag = (event) => {
-    const { item } = this.props;
-    const root = item.visibleRoot;
-    const doc = item.visibleDoc;
-    const anchor = this.dragAnchor;
+  const points = bbox ? [
+    {
+      x: bbox.left,
+      y: bbox.top,
+    },
+    {
+      x: bbox.right,
+      y: bbox.top,
+    },
+    {
+      x: bbox.left,
+      y: bbox.bottom,
+    },
+    {
+      x: bbox.right,
+      y: bbox.bottom,
+    },
+  ] : [];
 
-    const offset = findGlobalOffset(anchor.startContainer, anchor.startOffset, root);
-    const region = this.draggableRegion;
-    const dragTarget = item.isFreezingEdge ? event.path[1] : event.target;
-
-    this.spanOffsets = [region.globalOffsets.start - offset, region.globalOffsets.end - offset];
-    this._setSelectionStyle(dragTarget, root, doc);
-    this.originalRange = [region.globalOffsets.start, region.globalOffsets.end];
-    item.initializedDrag = true;
-
-    region.addClass(region._stylesheet.state.dragging);
-  }
-
-  _onMouseMove = (event) => {
-    const { item } = this.props;
-
-    if (item.isDragging && item.isActive) {
-      event.preventDefault();
-
-      if (!item.initializedDrag) {
-        this._initializeDrag(event);
-      } else {
-        [this.adjustedOffsets, this.adjustedRange] = this._highlightSelection(
-          item.visibleRoot,
-          [event.clientX, event.clientY],
-          this.spanOffsets,
+  return (
+    <>
+      {bbox && (
+        <Rect
+          name="regions_selection"
+          x={bbox.left}
+          y={bbox.top}
+          width={bbox.right - bbox.left}
+          height={bbox.bottom - bbox.top}
+          stroke={SELECTION_COLOR}
+          strokeWidth={1}
+          listening={false}
+        />
+      )}
+      {points.map((point, idx) => {
+        return (
+          <Rect
+            key={idx}
+            x={point.x - 3}
+            y={point.y - 3}
+            width={6}
+            height={6}
+            fill={SELECTION_COLOR}
+            stroke={SELECTION_SECOND_COLOR}
+            strokeWidth={2}
+            listening={false}
+          />
         );
-      }
-    }
+      })}
+    </>
+  );
+});
+
+const SelectionRect = observer(({ item }) => {
+  const { x, y, width, height } = item;
+
+  const positionProps = {
+    x,
+    y,
+    width,
+    height,
+    listening: false,
+    strokeWidth: 1,
   };
 
+  return (
+    <>
+      <Rect
+        {...positionProps}
+        stroke={SELECTION_COLOR}
+        dash={SELECTION_DASH}
+      />
+      <Rect
+        {...positionProps}
+        stroke={SELECTION_SECOND_COLOR}
+        dash={SELECTION_DASH}
+        dashOffset={SELECTION_DASH[0]}
+      />
+    </>
+  );
+});
 
-  _highlightSelection = (root, cursor, offsets) => {
-    const { item } = this.props;
-    const doc = root.ownerDocument;
+const TRANSFORMER_BACK_ID = 'transformer_back';
 
-    const current = doc.caretRangeFromPoint(cursor[0], cursor[1]);
-    const selection = doc.defaultView.getSelection();
+const TransformerBack = observer(({ item }) => {
+  const { selectedRegionsBBox } = item;
+  const singleNodeMode = item.selectedRegions.length === 1;
+  const dragStartPointRef = useRef({ x: 0, y: 0 });
 
-    const offset = findGlobalOffset(current.startContainer, current.startOffset, root);
-    const regionOffsets = this.draggableRegion.globalOffsets;
+  return (
+    <Layer>
+      {selectedRegionsBBox && !singleNodeMode && (
+        <Rect
+          id={TRANSFORMER_BACK_ID}
+          fill="rgba(0,0,0,0)"
+          draggable
+          onClick={()=>{
+            item.annotation.unselectAreas();
+          }}
+          onMouseOver={(ev) => {
+            if (!item.annotation.relationMode) {
+              ev.target.getStage().container().style.cursor = Constants.POINTER_CURSOR;
+            }
+          }}
+          onMouseOut={(ev) => {
+            ev.target.getStage().container().style.cursor = Constants.DEFAULT_CURSOR;
+          }}
+          onDragStart={e=>{
+            dragStartPointRef.current = {
+              x: e.target.getAttr('x'),
+              y: e.target.getAttr('y'),
+            };
+          }}
+          dragBoundFunc={(pos) => {
+            let { x, y } = pos;
+            const { top, left, right, bottom } =  item.selectedRegionsBBox;
+            const { stageHeight, stageWidth } = item;
 
-    let globalOffsets = [offset + offsets[0], offset + offsets[1]];
+            const offset = {
+              x: dragStartPointRef.current.x-left,
+              y: dragStartPointRef.current.y-top,
+            };
 
-    if (item.isFreezingEdge) {
-      if (item.isFreezingEdge.left) {
-        globalOffsets = [regionOffsets.start, offset];
-      } else {
-        globalOffsets = [offset, regionOffsets.end];
-      }
-    }
+            x -=offset.x;
+            y -=offset.y;
 
-    if (globalOffsets[0] < 0) {
-      // don't allow to go beyond the starting point
-      globalOffsets = [0, offsets[1] - offsets[0]];
-    }
+            const bbox = { x, y, width: right - left, height: bottom  - top };
 
-    const range = findRangeNative(globalOffsets[0], globalOffsets[1], root);
+            const fixed = fixRectToFit(bbox, stageWidth, stageHeight);
 
-    if (!range) {
-      // don't allow to go beyond the document range
-      return [this.adjustedOffsets, this.adjustedRange];
-    }
+            if (fixed.width !== bbox.width) {
+              x += (fixed.width - bbox.width) * (fixed.x !== bbox.x ? -1 : 1);
+            }
 
-    selection.removeAllRanges();
-    selection.addRange(range);
-    return [globalOffsets, range];
-  };
+            if (fixed.height !== bbox.height) {
+              y += (fixed.height - bbox.height) * (fixed.y !== bbox.y ? -1 : 1);
+            }
 
-  _restoreOriginalRangeAsSelection = (doc, selection) => {
-    if (this.originalRange) {
-      const range = doc.createRange();
+            x +=offset.x;
+            y +=offset.y;
+            return { x, y };
+          }}
+        />
+      )}
+    </Layer>
+  );
+});
 
-      range.setStart(selection.anchorNode, this.originalRange[0]);
-      range.setEnd(selection.anchorNode, this.originalRange[1]);
-      selection.removeAllRanges();
-      selection.addRange(range);
-    }
-  };
+const SelectedRegions = observer(({ item, selectedRegions }) => {
+  if (!selectedRegions) return null;
+  const { brushRegions = [], shapeRegions = [] } = splitRegions(selectedRegions);
 
-  _onDragStop = () => {
-    const { item } = this.props;
+  return (
+    <>
+      <TransformerBack item={item}/>
+      {brushRegions.length > 0 && (
+        <Regions
+          key="brushes"
+          name="brushes"
+          regions={brushRegions}
+          useLayers={false}
+          showSelected
+          chankSize={0}
+        />
+      )}
 
-    if (!item.isDragging) return;
+      {shapeRegions.length > 0 && (
+        <Regions
+          key="shapes"
+          name="shapes"
+          regions={shapeRegions}
+          showSelected
+          chankSize={0}
+        />
+      )}
+    </>
+  );
+});
 
-    const rootEl = item.visibleNodeRef.current;
-    const root = rootEl?.contentDocument?.body ?? rootEl;
-    const doc = root.ownerDocument;
-    const selection = doc.defaultView.getSelection();
-    const text = getSelectionText(selection);
-    const region = this.draggableRegion;
+const SelectionLayer = observer(({ item, selectionArea }) => {
 
+  const scale = 1 / (item.zoomScale || 1);
 
-    item.isDragging = false;
-    item.initializedDrag = false;
-    this.spanOffsets = null;
-    this._removeSelectionStyle();
+  const [isMouseWheelClick, setIsMouseWheelClick] = useState(false);
+  const [shift, setShift] = useState(false);
+  const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === 'ZoomPanTool';
 
-    region.removeClass(region._stylesheet.state.dragging);
+  const dragHandler = (e) => setIsMouseWheelClick(e.buttons === 4);
 
-    if (!selection.isCollapsed) {
-      region.removeHighlight();
+  const handleKey = (e) => setShift(e.shiftKey);
 
-      const normedRange = {
-        isText: item.type === "text",
-        globalOffsets: this.adjustedOffsets,
-      };
+  useEffect(()=>{
+    window.addEventListener('keydown', handleKey);
+    window.addEventListener('keyup', handleKey);
+    window.addEventListener('mousedown', dragHandler);
+    window.addEventListener('mouseup', dragHandler);
+    return () => {
+      window.removeEventListener('keydown', handleKey);
+      window.removeEventListener('keyup', handleKey);
+      window.removeEventListener('mousedown', dragHandler);
+      window.removeEventListener('mouseup', dragHandler);
+    };
+  },[]);
 
-      item.highlightRegion(region, normedRange);
-      region.updateText(text);
-      region.selectRegion();
-      this.draggableRegion = undefined;
+  const disableTransform = item.zoomScale > 1 && (shift || isPanTool || isMouseWheelClick);
 
-      selection.empty();
-      selection.removeAllRanges();
-    }
+  let supportsTransform = true;
+  let supportsRotate = true;
+  let supportsScale = true;
+
+  item.selectedRegions?.forEach(shape => {
+    supportsTransform = supportsTransform && shape.supportsTransform === true;
+    supportsRotate = supportsRotate && shape.canRotate === true;
+    supportsScale = supportsScale && true;
+  });
+
+  supportsTransform =
+    supportsTransform &&
+    (item.selectedRegions.length > 1 ||
+      ((item.useTransformer || item.selectedShape?.preferTransformer) && item.selectedShape?.useTransformer));
+
+  return (
+    <Layer scaleX={scale} scaleY={scale}>
+      {selectionArea.isActive ? (
+        <SelectionRect item={selectionArea} />
+      ) : !supportsTransform && item.selectedRegions.length > 1 ? (
+        <SelectionBorders item={item} selectionArea={selectionArea} />
+      ) : null}
+      <ImageTransformer
+        item={item}
+        rotateEnabled={supportsRotate}
+        supportsTransform={!disableTransform && supportsTransform}
+        supportsScale={supportsScale}
+        selectedShapes={item.selectedRegions}
+        singleNodeMode={item.selectedRegions.length === 1}
+        useSingleNodeRotation={item.selectedRegions.length === 1 && supportsRotate}
+        draggableBackgroundSelector={`#${TRANSFORMER_BACK_ID}`}
+      />
+    </Layer>
+  );
+});
+
+const Selection = observer(({ item, selectionArea }) => {
+
+  return (
+    <>
+      <SelectedRegions key="selected-regions" item={item} selectedRegions={item.selectedRegions} />
+      <SelectionLayer item={item} selectionArea={selectionArea}/>
+    </>
+  );
+});
+
+const Crosshair = memo(forwardRef(({ width, height }, ref) => {
+  const [pointsV, setPointsV] = useState([50, 0, 50, height]);
+  const [pointsH, setPointsH] = useState([0, 100, width, 100]);
+  const [x, setX] = useState(100);
+  const [y, setY] = useState(50);
+
+  const [visible, setVisible] = useState(false);
+  const strokeWidth = 1;
+  const dashStyle = [3, 3];
+  let enableStrokeScale = true;
+
+  if (isFF(FF_DEV_1285)) {
+    enableStrokeScale = false;
   }
 
+  if (ref) {
+    ref.current = {
+      updatePointer(newX, newY) {
+        if (newX !== x) {
+          setX(newX);
+          setPointsV([newX, 0, newX, height]);
+        }
 
-  _onMouseUp = (ev) => {
-    const { item } = this.props;
-
-    if (item.isEditing) return;
-
-    if (isFF(FF_DEV_2786) && item.isDragging) {
-      this._onDragStop();
-      return;
-    }
-
-    const states = item.activeStates();
-    const rootEl = item.visibleNodeRef.current;
-    const root = rootEl?.contentDocument?.body ?? rootEl;
-    const label = states[0]?.selectedLabels?.[0];
-    const value = states[0]?.selectedValues?.();
-
-    if (!states || states.length === 0 || ev.ctrlKey || ev.metaKey) return this._selectRegions(ev.ctrlKey || ev.metaKey);
-    if (item.selectionenabled === false) return;
-
-    Utils.Selection.captureSelection(({ selectionText, range }) => {
-      if (!range || range.collapsed || !root.contains(range.startContainer) || !root.contains(range.endContainer)) {
-        return;
-      }
-
-      fixCodePointsInRange(range);
-
-      const normedRange = xpath.fromRange(range, root);
-
-      if (!normedRange) return;
-
-      if (this.doubleClickSelection && (
-        Date.now() - this.doubleClickSelection.time > DBLCLICK_TIMEOUT
-        || Math.abs(ev.pageX - this.doubleClickSelection.x) > DBLCLICK_RANGE
-        || Math.abs(ev.pageY - this.doubleClickSelection.y) > DBLCLICK_RANGE
-      )) {
-        this.doubleClickSelection = undefined;
-      }
-
-      normedRange._range = range;
-      normedRange.text = selectionText;
-      normedRange.isText = item.type === "text";
-      normedRange.dynamic = this.props.store.autoAnnotation;
-
-      if (isFF(FF_DEV_2786) && this.draggableRegion) {
-        item.highlightRegion(this.draggableRegion, normedRange);
-        this.draggableRegion = undefined;
-      } else {
-        item.addRegion(normedRange, this.doubleClickSelection);
-      }
-    }, {
-      window: rootEl?.contentWindow ?? window,
-      granularity: label?.granularity ?? item.granularity,
-      beforeCleanup: () => {
-        this.doubleClickSelection = undefined;
-        this._selectionMode = true;
+        if (newY !== y) {
+          setY(newY);
+          setPointsH([0, newY, width, newY]);
+        }
       },
-    });
-    this.doubleClickSelection = {
-      time: Date.now(),
-      value: value?.length ? value : undefined,
-      x: ev.pageX,
-      y: ev.pageY,
+      updateVisibility(visibility) {
+        setVisible(visibility);
+      },
+    };
+  }
+
+  return (
+    <Layer
+      name="crosshair"
+      listening={false}
+      opacity={visible ? 0.6 : 0}
+    >
+      <Group>
+        <Line
+          name="v-white"
+          points={pointsH}
+          stroke="#fff"
+
+        />
+        <Line
+          name="v-black"
+          points={pointsH}
+          stroke="#000"
+          strokeWidth={strokeWidth}
+          dash={dashStyle}
+
+        />
+      </Group>
+      <Group>
+        <Line
+          name="h-white"
+          points={pointsV}
+          stroke="#fff"
+          strokeWidth={strokeWidth}
+
+        />
+        <Line
+          name="h-black"
+          points={pointsV}
+          stroke="#000"
+          strokeWidth={strokeWidth}
+          dash={dashStyle}
+
+        />
+      </Group>
+    </Layer>
+  );
+}));
+
+export default observer(
+  class ImageView extends Component {
+    // stored position of canvas before creating region
+    canvasX;
+    canvasY;
+    lastOffsetWidth = -1;
+    lastOffsetHeight = -1;
+    state = {
+      imgStyle: {},
+      pointer: [0, 0],
     };
 
-    const selection = window.getSelection();
+    imageRef = createRef();
+    crosshairRef = createRef();
+    handleDeferredMouseDown = null;
+    deferredClickTimeout = [];
+    skipMouseUp = false;
 
-    selection.empty();
-    selection.removeAllRanges();
-  };
+    constructor(props) {
+      super(props);
 
-  _enableEditing = (event) => {
-    const { item } = this.props;
-    const root = item.visibleRoot;
-    const doc = root.ownerDocument;
-    const range = doc.caretRangeFromPoint(event.clientX, event.clientY);
-
-
-    item.annotation.regionStore.unselectAll();
-    item.setIsEditing(true);
-    root.contentEditable = 'true';
-
-    const selection = doc.defaultView.getSelection();
-
-    selection.removeAllRanges();
-    selection.addRange(range);
-
-    const fn = ev => {
-      if (ev.key === "Escape") {
-        ev.stopPropagation();
-        ev.preventDefault();
-        item.setIsEditing(false);
-        root.contentEditable = 'false';
-        root.removeEventListener("keydown", fn);
-      }
-    };
-
-    root.addEventListener("keydown", fn);
-  };
-
-  /**
-   * @param {MouseEvent} event
-   */
-  _onRegionClick = event => {
-    if (this._selectionMode) {
-      this._selectionMode = false;
-      return;
-    }
-    if (!this.props.item.clickablelinks && matchesSelector(event.target, "a[href]")) {
-      event.preventDefault();
-      return;
+      if (typeof props.item.smoothing === 'boolean')
+        props.store.settings.setSmoothing(props.item.smoothing);
     }
 
-    const region = this._determineRegion(event.target);
-
-    if (!region) {
-      if (!this.props.item.isEditing) this._enableEditing(event);
-      return;
-    }
-
-    if (this.props.item.isEditing) return;
-
-    region && region.onClickRegion(event);
-    event.stopPropagation();
-  };
-
-  /**
-   * @param {MouseEvent} event
-   */
-  _onRegionMouseOver = event => {
-    const region = this._determineRegion(event.target);
-    const { item } = this.props;
-
-    item.setHighlight(region);
-  };
-
-  _removeChildrenFrom(el) {
-    while (el.lastChild) {
-      el.removeChild(el.lastChild);
-    }
-  }
-
-  _moveElements(src, dest, withSubstitution) {
-    const fragment = document.createDocumentFragment();
-
-    for (let i = 0;i < src.childNodes.length;  withSubstitution && i++){
-      const currentChild = src.childNodes[i];
-
-      if (withSubstitution) {
-        const cloneChild = currentChild.cloneNode(true);
-
-        src.replaceChild(cloneChild, currentChild);
-      }
-
-      fragment.append(currentChild);
-    }
-    this._removeChildrenFrom(dest);
-    dest.appendChild(fragment);
-  }
-
-  _moveStyles = moveStylesBetweenHeadTags;
-
-  _moveElementsToWorkingNode = () => {
-    const { item } = this.props;
-    const rootEl = item.visibleNodeRef.current;
-    const workingEl = item.workingNodeRef.current;
-
-    if (item.inline) {
-      this._moveElements(rootEl, workingEl, true);
-    } else {
-      const rootHtml = rootEl.contentDocument.documentElement;
-      const rootBody = rootEl.contentDocument.body;
-      const workingHtml = workingEl.contentDocument.documentElement;
-      const workingHead = workingEl.contentDocument.head;
-      const workingBody = workingEl.contentDocument.body;
-
-      workingHtml.setAttribute("style", rootHtml.getAttribute("style"));
-      this._removeChildrenFrom(workingHead);
-      this._moveElements(rootBody, workingBody, true);
-    }
-    item.setWorkingMode(true);
-  }
-
-  _returnElementsFromWorkingNode = () => {
-    const { item } = this.props;
-    const rootEl = item.visibleNodeRef.current;
-    const workingEl = item.workingNodeRef.current;
-
-    if (item.inline) {
-      this._moveElements(workingEl, rootEl);
-    } else {
-      const rootHtml = rootEl.contentDocument.documentElement;
-      const rootHead = rootEl.contentDocument.head;
-      const rootBody = rootEl.contentDocument.body;
-      const workingHtml = workingEl.contentDocument.documentElement;
-      const workingHead = workingEl.contentDocument.head;
-      const workingBody = workingEl.contentDocument.body;
-
-      rootHtml.setAttribute("style", workingHtml.getAttribute("style"));
-      this._moveStyles(workingHead, rootHead);
-      this._moveElements(workingBody, rootBody);
-    }
-    item.setWorkingMode(false);
-  }
-
-  /**
-   * Handle initial rendering and all subsequent updates
-   */
-  _handleUpdate(initial = false) {
-    const { item } = this.props;
-    const rootEl = item.visibleNodeRef.current;
-    const root = rootEl?.contentDocument?.body ?? rootEl;
-
-    if (!item.inline) {
-      // @todo how could it be IFRAME? it's root tag for inline and body for iframe; some bug?
-      if (!root || root.tagName === "IFRAME" || !root.childNodes.length || item.isLoaded === false) return;
-    }
-
-    // Apply highlight to ranges of a current tag
-    // Also init regions' offsets and html range on initial load
-
-    if (initial) {
-      const { history, pauseAutosave, startAutosave } = item.annotation;
-
-      pauseAutosave();
-      history.freeze("richtext:init");
-      item.needsUpdate();
-      history.setReplaceNextUndoState(true);
-      history.unfreeze("richtext:init");
-      startAutosave();
-    } else {
-      item.needsUpdate();
-    }
-  }
-
-  /**
-   * Detects a RichTextRegion corresponding to a span
-   * @param {HTMLElement} element
-   */
-  _determineRegion(element) {
-    if (matchesSelector(element, this._regionSpanSelector)) {
-      const span = element.tagName === "SPAN" ? element : element.closest(this._regionSpanSelector);
+    handleOnClick = e => {
       const { item } = this.props;
 
-      return item.regs.find(region => region.find(span));
-    }
-  }
-
-  componentDidMount() {
-    const { item } = this.props;
-
-    item.setNeedsUpdateCallbacks(
-      this._moveElementsToWorkingNode,
-      this._returnElementsFromWorkingNode,
-    );
-
-    if (!item.inline) {
-      this.dispose = observe(item, "_isReady", this.updateLoadingVisibility, true);
-    }
-  }
-
-  componentWillUnmount() {
-    const { item } = this.props;
-
-    if (!item || !isAlive(item)) return;
-
-    this.dispose?.();
-    item.setLoaded(false);
-    item.setReady(false);
-  }
-
-  markObjectAsLoaded() {
-    const { item } = this.props;
-
-    if (!item || !isAlive(item)) return;
-
-    item.setLoaded(true);
-    this.updateLoadingVisibility();
-
-    // run in the next tick to have all the refs initialized
-    setTimeout(() => this._handleUpdate(true));
-  }
-
-  // no isReady observing in render
-  updateLoadingVisibility = () => {
-    const { item } = this.props;
-    const loadingEl = this.loadingRef.current;
-
-    if (!loadingEl) return;
-    if (item && isAlive(item) && item.isLoaded && item.isReady) {
-      loadingEl.setAttribute("style", "display: none");
-    } else {
-      loadingEl.removeAttribute("style");
-    }
-  }
-
-  // @todo block Ctrl+Z in editing mode
-  _passHotkeys = e => {
-    const props = "key code keyCode location ctrlKey shiftKey altKey metaKey".split(" ");
-    const init = {};
-
-    for (const prop of props) init[prop] = e[prop];
-
-    const internal = new KeyboardEvent(e.type, init);
-
-    document.dispatchEvent(internal);
-  }
-
-  _recalcOffsets = () => {
-    const { item } = this.props;
-    const root = item.visibleRoot;
-
-    item.regs.forEach(reg => {
-      const spans = reg._spans;
-
-      if (!spans.some(span => span.isConnected)) {
-        console.log("DELETE");
+      if (isFF(FF_DEV_1442)) {
+        this.handleDeferredMouseDown?.();
+      }
+      if (this.skipMouseUp) {
+        this.skipMouseUp = false;
         return;
       }
 
-      const lastSpan = spans[spans.length - 1];
-      const stored = reg.globalOffsets;
-      // @todo more correct is to find min of every span's start and max of ends
-      const actual = [
-        findGlobalOffset(spans[0], 0, root),
-        findGlobalOffset(lastSpan, lastSpan.textContent.length, root),
-      ];
+      const evt = e.evt || e;
 
-      if (actual[0] !== stored.start || actual[1] !== stored.end) {
-        reg.updateGlobalOffsets(...actual);
-      }
-    });
-  }
-
-  _pasteOnlyText = (e) => {
-    e.preventDefault();
-
-    const data = e.clipboardData || window.clipboardData;
-    const paste = data.getData('text');
-    const doc = this.props.item.visibleDoc;
-    const selection = doc.defaultView.getSelection();
-
-    if (!selection.rangeCount) return;
-    selection.deleteFromDocument();
-    selection.getRangeAt(0).insertNode(document.createTextNode(paste));
-    selection.collapseToEnd();
-  }
-
-  _getEventHandlers = (asProps = false) => {
-    const forIframe = !asProps;
-    const handlers = {
-      Click: [this._onRegionClick, true],
-      MouseUp: [this._onMouseUp, false],
-      MouseOver: [this._onRegionMouseOver, true],
-      Input: [this._recalcOffsets, true],
-      Paste: [this._pasteOnlyText, true],
+      return item.event('click', evt, evt.offsetX, evt.offsetY);
     };
 
-    if (isFF(FF_DEV_2786)) {
-      Object.assign(handlers, {
-        MouseDown: [this._onMouseDown, true],
-        MouseMove: [this._onMouseMove, true],
-      });
-    }
-
-    if (forIframe) {
-      Object.assign(handlers, {
-        KeyDown: [this._passHotkeys, false],
-        KeyUp: [this._passHotkeys, false],
-        KeyPress: [this._passHotkeys, false],
-      });
-    }
-
-    if (asProps) {
-      const props = {};
-
-      for (const name in handlers) {
-        const [handler, capture] = handlers[name];
-
-        props["on" + name + (capture ? "Capture" : "")] = handler;
+    resetDeferredClickTimeout = () => {
+      if (this.deferredClickTimeout.length > 0) {
+        this.deferredClickTimeout = this.deferredClickTimeout.filter((timeout) => {
+          clearTimeout(timeout);
+          return false;
+        });
       }
-      return props;
-    }
+    };
 
-    return handlers;
-  }
+    handleDeferredClick = (handleDeferredMouseDownCallback, handleDeselection, eligibleToDeselect = false) => {
+      this.handleDeferredMouseDown = () => {
+        if (eligibleToDeselect) {
+          handleDeselection();
+        }
+        handleDeferredMouseDownCallback();
+      };
+      this.resetDeferredClickTimeout();
+      this.deferredClickTimeout.push(setTimeout(() => {
+        this.handleDeferredMouseDown?.();
+      }, this.props.item.annotation.isDrawing ? 0 : 100));
+    };
 
-  onIFrameLoad = () => {
-    const { item } = this.props;
-    const iframe = item.visibleNodeRef.current;
-    const doc = iframe?.contentDocument;
-    const body = doc?.body;
-    const htmlEl = body?.parentElement;
-    const eventHandlers = this._getEventHandlers(false);
+    handleMouseDown = e => {
+      const { item } = this.props;
+      const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === 'ZoomPanTool';
 
-    if (!body) return;
+      item.updateSkipInteractions(e);
 
-    for (const event in eventHandlers) {
-      body.addEventListener(event.toLowerCase(), ...eventHandlers[event]);
-    }
+      const p = e.target.getParent();
 
-    // @todo remove this, project-specific
-    // fix unselectable links
-    const style = doc.createElement("style");
+      if (!item.annotation.editable && !isPanTool) return;
+      if (p && p.className === 'Transformer') return;
 
-    style.textContent = "body a[href] { pointer-events: all; }";
-    doc.head.appendChild(style);
+      const handleMouseDown = () => {
+        if (
+        // create regions over another regions with Cmd/Ctrl pressed
+          item.getSkipInteractions() ||
+          e.target === item.stageRef ||
+          findClosestParent(
+            e.target,
+            el => el.nodeType === 'Group' && ['ruler', 'segmentation'].indexOf(el?.attrs?.name) > -1,
+          )
+        ) {
+          window.addEventListener('mousemove', this.handleGlobalMouseMove);
+          window.addEventListener('mouseup', this.handleGlobalMouseUp);
+          const { offsetX: x, offsetY: y } = e.evt;
+          // store the canvas coords for calculations in further events
+          const { left, top } = item.containerRef.getBoundingClientRect();
 
-    // // @todo make links selectable; dragstart supressing doesn't help — they are still draggable
-    // body.addEventListener("dragstart", e => {
-    //   e.stopPropagation();
-    //   e.preventDefault();
-    // });
+          this.canvasX = left;
+          this.canvasY = top;
+          item.event('mousedown', e, x, y);
 
-    // auto-height
-    if (body.scrollHeight) {
-      // body dimensions sometimes doesn't count some inner content offsets
-      // but html's offsetHeight sometimes is zero, so get the max of both
-      iframe.style.height = Math.max(body.scrollHeight, htmlEl.offsetHeight) + "px";
-    }
+          return true;
+        }
+      };
 
-    this.markObjectAsLoaded();
-  }
+      const selectedTool = item.getToolsManager().findSelectedTool();
+      const eligibleToolForDeselect = [
+        undefined,
+        'EllipseTool',
+        'EllipseTool-dynamic',
+        'RectangleTool',
+        'RectangleTool-dynamic',
+        'PolygonTool',
+        'PolygonTool-dynamic',
+        'Rectangle3PointTool',
+        'Rectangle3PointTool-dynamic',
+      ].includes(selectedTool?.fullName);
 
-  render() {
-    const { item } = this.props;
-    const style = item.isEditing ? { outline: "1px solid black" } : {};
+      if (isFF(FF_DEV_1442) && eligibleToolForDeselect) {
+        const targetIsCanvas = e.target === item.stageRef;
+        const annotationHasSelectedRegions = item.annotation.selectedRegions.length > 0;
+        const eligibleToDeselect = targetIsCanvas && annotationHasSelectedRegions;
 
-    if (!item._value) return null;
+        const handleDeselection = () => {
+          item.annotation.unselectAll();
+          this.skipMouseUp = true;
+        };
 
-    let val = item._value || "";
-    const newLineReplacement = "<br/>";
-    const settings = this.props.store.settings;
-    const isText = item.type === 'text';
+        this.handleDeferredClick(handleMouseDown, handleDeselection, eligibleToDeselect);
+        return;
+      }
 
-    if (isText) {
-      const cnLine = cn("richtext", { elem: "line" });
+      const result = handleMouseDown();
 
-      val = htmlEscape(val)
-        .split(/\n|\r/g)
-        .map(s => `<span class="${cnLine}">${s}</span>`)
-        .join(newLineReplacement);
-    }
+      if (result) return result;
 
-    if (item.inline) {
-      const eventHandlers = this._getEventHandlers(true);
+      return true;
+    };
+
+    /**
+     * Mouse up outside the canvas
+     */
+    handleGlobalMouseUp = e => {
+      window.removeEventListener('mousemove', this.handleGlobalMouseMove);
+      window.removeEventListener('mouseup', this.handleGlobalMouseUp);
+
+      if (e.target && e.target.tagName === 'CANVAS') return;
+
+      const { item } = this.props;
+      const { clientX: x, clientY: y } = e;
+
+      item.freezeHistory();
+
+      return item.event('mouseup', e, x - this.canvasX, y - this.canvasY);
+    };
+
+    handleGlobalMouseMove = e => {
+      if (e.target && e.target.tagName === 'CANVAS') return;
+
+      const { item } = this.props;
+      const { clientX: x, clientY: y } = e;
+
+      return item.event('mousemove', e, x - this.canvasX, y - this.canvasY);
+    };
+
+    /**
+     * Mouse up on Stage
+     */
+    handleMouseUp = e => {
+      const { item } = this.props;
+
+      if (isFF(FF_DEV_1442)) {
+        this.resetDeferredClickTimeout();
+      }
+
+      item.freezeHistory();
+      item.setSkipInteractions(false);
+
+      return item.event('mouseup', e, e.evt.offsetX, e.evt.offsetY);
+    };
+
+    handleMouseMove = e => {
+      const { item } = this.props;
+
+      item.freezeHistory();
+
+      this.updateCrosshair(e);
+
+      const isMouseWheelClick = e.evt && e.evt.buttons === 4;
+      const isDragging = e.evt && e.evt.buttons === 1;
+      const isShiftDrag = isDragging && e.evt.shiftKey;
+
+      if (isFF(FF_DEV_1442) && isDragging) {
+        this.resetDeferredClickTimeout();
+        this.handleDeferredMouseDown?.();
+      }
+
+      if ((isMouseWheelClick || isShiftDrag) && item.zoomScale > 1) {
+        item.setSkipInteractions(true);
+        e.evt.preventDefault();
+
+        const newPos = {
+          x: item.zoomingPositionX + e.evt.movementX,
+          y: item.zoomingPositionY + e.evt.movementY,
+        };
+
+        item.setZoomPosition(newPos.x, newPos.y);
+      } else {
+        item.event('mousemove', e, e.evt.offsetX, e.evt.offsetY);
+      }
+    };
+
+    updateCrosshair = (e) => {
+      if (this.crosshairRef.current) {
+        const { x, y } = e.currentTarget.getPointerPosition();
+
+
+      }
+    };
+
+    handleError = () => {
+      const { item, store } = this.props;
+      const cs = store.annotationStore;
+      const message = getEnv(store).messages.ERR_LOADING_HTTP({ attr: item.value, error: '', url: item._value });
+
+      cs.addErrors([errorBuilder.generalError(message)]);
+    };
+
+    updateGridSize = range => {
+      const { item } = this.props;
+
+      item.freezeHistory();
+
+      item.setGridSize(range);
+    };
+
+    /**
+     * Handle to zoom
+     */
+    handleZoom = e => {
+      /**
+       * Disable if user doesn't use ctrl
+       */
+      if (e.evt && !e.evt.ctrlKey) {
+        return;
+      } else if (e.evt && e.evt.ctrlKey) {
+        /**
+         * Disable scrolling page
+         */
+        e.evt.preventDefault();
+      }
+      if (e.evt) {
+        const { item } = this.props;
+        const stage = item.stageRef;
+
+        item.handleZoom(e.evt.deltaY, stage.getPointerPosition());
+      }
+    };
+
+    renderRulers() {
+      const { item } = this.props;
+      const width = 1;
+      const color = 'white';
 
       return (
-        <Block
-          name="richtext"
-          tag={ObjectTag}
-          item={item}
+        <Group
+          name="ruler"
+          onClick={ev => {
+            ev.cancelBubble = false;
+          }}
         >
-          <Elem
-            key="root"
-            name="container"
-            ref={el => {
-              item.visibleNodeRef.current = el;
-              el && this.markObjectAsLoaded();
-            }}
-            data-linenumbers={isText && settings.showLineNumbers ? "enabled" : "disabled"}
-            className="htx-richtext"
-            dangerouslySetInnerHTML={{ __html: val }}
-            {...eventHandlers}
-            style={style}
+          <Line
+            x={0}
+            y={item.cursorPositionY}
+            points={[0, 0, item.stageWidth, 0]}
+            strokeWidth={width}
+            stroke={color}
+            tension={0}
+            dash={[4, 4]}
+            closed
           />
-          <Elem
-            key="orig"
-            name="orig-container"
-            ref={item.originalContentRef}
-            className="htx-richtext-orig"
-            dangerouslySetInnerHTML={{ __html: val }}
+          <Line
+            x={item.cursorPositionX}
+            y={0}
+            points={[0, 0, 0, item.stageHeight]}
+            strokeWidth={width}
+            stroke={color}
+            tension={0}
+            dash={[1.5]}
+            closed
           />
-          <Elem
-            key="work"
-            name="work-container"
-            ref={item.workingNodeRef}
-            className="htx-richtext-work"
-          />
-        </Block>
+        </Group>
       );
-    } else {
+    }
+
+    onResize = debounce(() => {
+      if (!this?.props?.item?.containerRef) return;
+      const { offsetWidth, offsetHeight } = this.props.item.containerRef;
+
+      if (this.props.item.naturalWidth <= 1) return;
+      if (this.lastOffsetWidth === offsetWidth && this.lastOffsetHeight === offsetHeight) return;
+
+      this.props.item.onResize(offsetWidth, offsetHeight, true);
+      this.lastOffsetWidth = offsetWidth;
+      this.lastOffsetHeight = offsetHeight;
+    }, 16);
+
+    componentDidMount() {
+      const { item } = this.props;
+
+      window.addEventListener('resize', this.onResize);
+      this.attachObserver(item.containerRef);
+      this.updateReadyStatus();
+
+      hotkeys.addDescription('shift', 'Pan image');
+    }
+
+    attachObserver = (node) => {
+      if (this.resizeObserver) this.detachObserver();
+
+      if (node) {
+        this.resizeObserver = new ResizeObserver(this.onResize);
+        this.resizeObserver.observe(node);
+      }
+    };
+
+    detachObserver = () => {
+      if (this.resizeObserver) {
+        this.resizeObserver.disconnect();
+        this.resizeObserver = null;
+      }
+    };
+
+    componentWillUnmount() {
+      this.detachObserver();
+      window.removeEventListener('resize', this.onResize);
+
+      hotkeys.removeDescription('shift');
+    }
+
+    componentDidUpdate() {
+      this.onResize();
+      this.updateReadyStatus();
+    }
+
+    updateReadyStatus() {
+      const { item } = this.props;
+      const { imageRef } = this;
+
+      if (!item || !isAlive(item) || !imageRef.current) return;
+      if (item.isReady !== imageRef.current.complete) item.setReady(imageRef.current.complete);
+    }
+
+    renderTools() {
+      const { item, store } = this.props;
+      const cs = store.annotationStore;
+
+      if (cs.viewingAllAnnotations || cs.viewingAllPredictions) return null;
+
+      const tools = item.getToolsManager().allTools();
+
       return (
-        <Block
-          name="richtext"
-          tag={ObjectTag}
+        <Toolbar tools={tools} />
+      );
+    }
+
+    render() {
+
+      const { item, store } = this.props;
+
+      // @todo stupid but required check for `resetState()`
+      // when Image tries to render itself after detouching
+      if (!isAlive(item)) return null;
+
+      // TODO fix me
+      if (!store.task || !item._value) return null;
+
+      const regions = item.regs;
+
+      const containerStyle = {};
+
+      const containerClassName = styles.container;
+
+      if (getRoot(item).settings.fullscreen === false) {
+        containerStyle['maxWidth'] = item.maxwidth;
+        containerStyle['maxHeight'] = item.maxheight;
+        containerStyle['width'] = item.width;
+        containerStyle['height'] = item.height;
+      }
+
+      if (!this.props.store.settings.enableSmoothing && item.zoomScale > 1){
+        containerStyle['imageRendering'] = 'pixelated';
+      }
+
+      const imagePositionClassnames =  [
+        styles['image_position'],
+        styles[`image_position__${item.verticalalignment === 'center' ? 'middle' : item.verticalalignment}`],
+        styles[`image_position__${item.horizontalalignment}`],
+      ];
+
+      const wrapperClasses = [
+        styles.wrapperComponent,
+        item.images.length > 1 ? styles.withGallery : styles.wrapper,
+      ];
+
+      const {
+        brushRegions,
+        shapeRegions,
+      } = splitRegions(regions);
+
+      const {
+        brushRegions: suggestedBrushRegions,
+        shapeRegions: suggestedShapeRegions,
+      } = splitRegions(item.suggestions);
+
+      const renderableRegions = Object.entries({
+        brush: brushRegions,
+        shape: shapeRegions,
+        suggestedBrush: suggestedBrushRegions,
+        suggestedShape: suggestedShapeRegions,
+      });
+
+      return (
+        <ObjectTag
           item={item}
+          className={wrapperClasses.join(' ')}
         >
-          {/* // @todo fix it someday, on rerender it should be hidden */}
-          {false && (!item.isLoaded || !item.isReady) && (
-            <Elem name="loading" ref={this.loadingRef}>
-              <LoadingOutlined />
-            </Elem>
+          <div
+            ref={node => {
+              item.setContainerRef(node);
+              this.attachObserver(node);
+            }}
+            className={containerClassName}
+            style={containerStyle}
+          >
+            <div
+              ref={node => {
+                this.filler = node;
+              }}
+              className={styles.filler}
+              style={{ width: '100%', marginTop: item.fillerHeight }}
+            />
+            <div
+              className={[
+                styles.frame,
+                ...imagePositionClassnames,
+              ].join(' ')}
+              style={item.canvasSize}
+            >
+              <img
+                ref={ref => {
+                  item.setImageRef(ref);
+                  this.imageRef.current = ref;
+                }}
+                loading={(isFF(FF_DEV_3077) && !item.lazyoff) && 'lazy'}
+                style={item.imageTransform}
+                src={item._value}
+                onLoad={item.updateImageSize}
+                onError={this.handleError}
+                crossOrigin={item.imageCrossOrigin}
+                alt="LS"
+              />
+              {isFF(FF_DEV_4081)
+                ? (
+                  <canvas
+                    className={styles.overlay}
+                    ref={ref => {
+                      item.setOverlayRef(ref);
+                    }}
+                    style={item.imageTransform}
+                  />
+
+          {this.renderTools()}
+          {item.images.length > 1 && (
+            <div className={styles.gallery}>
+              {item.images.map((src, i) => (
+                <img
+                  alt=""
+                  key={src}
+                  src={src}
+                  className={i === item.currentImage && styles.active}
+                  height="60"
+                  onClick={() => item.setCurrentImage(i)}
+                />
+              ))}
+            </div>
           )}
-
-          <Elem
-            key="root"
-            name="iframe"
-            tag="iframe"
-            referrerPolicy="no-referrer"
-            sandbox="allow-same-origin allow-scripts"
-            ref={el => {
-              item.setReady(false);
-              item.visibleNodeRef.current = el;
-            }}
-            className="htx-richtext"
-            srcDoc={val}
-            onLoad={this.onIFrameLoad}
-            style={style}
-          />
-          <Elem
-            key="orig"
-            name="orig-iframe"
-            tag="iframe"
-            referrerPolicy="no-referrer"
-            sandbox="allow-same-origin allow-scripts"
-            ref={item.originalContentRef}
-            className="htx-richtext-orig"
-            srcDoc={val}
-          />
-          <Elem
-            key="work"
-            name="work-iframe"
-            tag="iframe"
-            referrerPolicy="no-referrer"
-            sandbox="allow-same-origin allow-scripts"
-            ref={item.workingNodeRef}
-            className="htx-richtext-work"
-          />
-        </Block>
+        </ObjectTag>
       );
     }
-  }
-}
-
-const storeInjector = inject("store");
-
-const RPTV = storeInjector(observer(RichTextPieceView));
-
-export const HtxRichText = ({ isText = false } = {}) => {
-  return storeInjector(observer(props => {
-    return <RPTV {...props} isText={isText} />;
-  }));
-};
+  },
+);
