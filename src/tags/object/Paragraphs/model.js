@@ -57,6 +57,7 @@ import styles from './Paragraphs.module.scss';
  * @regions ParagraphsRegion
  * @meta_title Paragraph Tags for Paragraphs
  * @meta_description Customize Label Studio with the Paragraphs tag to annotate paragraphs for NLP and NER machine learning and data science projects.
+
  * @param {string} name                   - Name of the element
  * @param {string} value                  - Data field containing the paragraph content
  * @param {json|url} [valueType=json]     - Whether the data is stored directly in uploaded JSON data or needs to be loaded from a URL
@@ -87,7 +88,6 @@ const TagAttrs = types.model('ParagraphsModel', {
 
   namekey: types.optional(types.string, 'author'),
   textkey: types.optional(types.string, 'text'),
-  contextscroll: types.optional(types.boolean, false),
 });
 
 const Model = types

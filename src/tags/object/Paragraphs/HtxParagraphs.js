@@ -1,3 +1,4 @@
+
 import React, { Component, createRef, forwardRef, Fragment, memo, useEffect, useRef, useState } from 'react';
 import { Group, Layer, Line, Rect, Stage } from 'react-konva';
 import { observer } from 'mobx-react';
@@ -804,6 +805,7 @@ export default observer(
       if (!store.task || !item._value) return null;
 
       const regions = item.regs;
+
 
       const containerStyle = {};
 

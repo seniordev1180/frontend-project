@@ -348,6 +348,7 @@ const SelectionLayer = observer(({ item, selectionArea }) => {
 
 const Selection = observer(({ item, selectionArea }) => {
 
+
   return (
     <>
       <SelectedRegions key="selected-regions" item={item} selectedRegions={item.selectedRegions} />
