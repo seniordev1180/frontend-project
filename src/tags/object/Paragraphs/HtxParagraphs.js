@@ -1,450 +1,922 @@
-import React, { Component } from 'react';
-import { inject, observer } from 'mobx-react';
 
-import ObjectTag from '../../../components/Tags/Object';
-import { FF_DEV_2669, FF_DEV_2918, FF_LSDV_3012, FF_LSDV_4711, isFF } from '../../../utils/feature-flags';
-import { findNodeAt, matchesSelector, splitBoundaries } from '../../../utils/html';
-import { isSelectionContainsSpan } from '../../../utils/selection-tools';
-import styles from './Paragraphs.module.scss';
-import { AuthorFilter } from './AuthorFilter';
-import { Phrases } from './Phrases';
+import React, { Component, createRef, forwardRef, Fragment, memo, useEffect, useRef, useState } from 'react';
+import { Group, Layer, Line, Rect, Stage } from 'react-konva';
+import { observer } from 'mobx-react';
+import { getEnv, getRoot, isAlive } from 'mobx-state-tree';
 
-const audioDefaultProps = {};
+import ImageGrid from '../ImageGrid/ImageGrid';
+import ImageTransformer from '../ImageTransformer/ImageTransformer';
+import ObjectTag from '../../components/Tags/Object';
+import Tree from '../../core/Tree';
+import styles from './ImageView.module.scss';
+import { errorBuilder } from '../../core/DataValidator/ConfigValidator';
+import { chunks, findClosestParent } from '../../utils/utilities';
+import Konva from 'konva';
+import { LoadingOutlined } from '@ant-design/icons';
+import { Toolbar } from '../Toolbar/Toolbar';
+import { ImageViewProvider } from './ImageViewContext';
+import { Hotkey } from '../../core/Hotkey';
+import { useObserver } from 'mobx-react';
+import ResizeObserver from '../../utils/resize-observer';
+import { debounce } from '../../utils/debounce';
+import Constants from '../../core/Constants';
+import { fixRectToFit } from '../../utils/image';
+import { FF_DEV_1285, FF_DEV_1442, FF_DEV_3077, FF_DEV_4081, isFF } from '../../utils/feature-flags';
 
-if (isFF(FF_LSDV_4711)) audioDefaultProps.crossOrigin = 'anonymous';
+Konva.showWarnings = false;
 
-class HtxParagraphsView extends Component {
-  _regionSpanSelector = '.htx-highlight';
+const hotkeys = Hotkey('Image');
 
-  constructor(props) {
-    super(props);
-    this.myRef = React.createRef();
-  }
+const splitRegions = (regions) => {
+  const brushRegions = [];
+  const shapeRegions = [];
+  const l = regions.length;
+  let i = 0;
 
-  getSelectionText(sel) {
-    return sel.toString();
-  }
+  for (i; i < l; i++) {
+    const region = regions[i];
 
-  getPhraseElement(node) {
-    const cls = this.props.item.layoutClasses;
-
-    while (node && (!node.classList || !node.classList.contains(cls.text))) node = node.parentNode;
-    return node;
-  }
-
-  get phraseElements() {
-    return [...this.myRef.current.getElementsByClassName(this.props.item.layoutClasses.text)];
-  }
-
-  /**
-   * Check for the selection in the phrase and return the offset and index.
-   *
-   * @param {HTMLElement} node
-   * @param {number} offset
-   * @param {boolean} [isStart=true]
-   * @return {Array} [offset, node, index, originalIndex]
-   */
-  getOffsetInPhraseElement(container, offset, isStart = true) {
-    const node = this.getPhraseElement(container);
-    const range = document.createRange();
-
-    range.setStart(node, 0);
-    range.setEnd(container, offset);
-    const fullOffset = range.toString().length;
-    const phraseIndex = this.phraseElements.indexOf(node);
-    let phraseNode = node;
-
-    // if the selection is made from the very end of a given phrase, we need to
-    // move the offset to the beginning of the next phrase
-    if (isStart && fullOffset === phraseNode.textContent.length) {
-      return [0, phraseNode, phraseIndex + 1, phraseIndex];
+    if (region.type === 'brushregion') {
+      brushRegions.push(region);
+    } else {
+      shapeRegions.push(region);
     }
-    // if the selection is made to the very beginning of the next phrase, we need to
-    // move the offset to the end of the previous phrase
-    else if (!isStart && fullOffset === 0) {
-      phraseNode = this.phraseElements[phraseIndex - 1];
-      return [phraseNode.textContent.length, phraseNode, phraseIndex - 1, phraseIndex];
-    }
-
-    return [fullOffset, phraseNode, phraseIndex, phraseIndex];
   }
 
-  removeSurroundingNewlines(text) {
-    return text.replace(/^\n+/, '').replace(/\n+$/, '');
-  }
+  return {
+    brushRegions,
+    shapeRegions,
+  };
+};
 
-  captureDocumentSelection() {
-    const item = this.props.item;
-    const cls = item.layoutClasses;
-    const names = [...this.myRef.current.getElementsByClassName(cls.name)];
+const Region = memo(({ region, showSelected = false }) => {
+  return useObserver(() => region.inSelection !== showSelected ? null : Tree.renderItem(region, region.annotation, false));
+});
 
-    names.forEach(el => {
-      el.style.visibility = 'hidden';
-    });
+const RegionsLayer = memo(({ regions, name, useLayers, showSelected = false }) => {
+  const content = regions.map((el) => (
+    <Region key={`region-${el.id}`} region={el} showSelected={showSelected} />
+  ));
 
-    let i;
+  return useLayers === false ? (
+    content
+  ) : (
+    <Layer name={name}>
+      {content}
+    </Layer>
+  );
+});
 
-    const ranges = [];
-    const selection = window.getSelection();
+const Regions = memo(({ regions, useLayers = true, chunkSize = 15, suggestion = false, showSelected = false }) => {
+  return (
+    <ImageViewProvider value={{ suggestion }}>
+      {(chunkSize ? chunks(regions, chunkSize) : regions).map((chunk, i) => (
+        <RegionsLayer
+          key={`chunk-${i}`}
+          name={`chunk-${i}`}
+          regions={chunk}
+          useLayers={useLayers}
+          showSelected={showSelected}
+        />
+      ))}
+    </ImageViewProvider>
+  );
+});
 
-    if (selection.isCollapsed) {
-      names.forEach(el => {
-        el.style.visibility = 'unset';
-      });
-      return [];
-    }
+const DrawingRegion = observer(({ item }) => {
+  const { drawingRegion } = item;
+  const Wrapper = drawingRegion && drawingRegion.type === 'brushregion' ? Fragment : Layer;
 
-    for (i = 0; i < selection.rangeCount; i++) {
-      const r = selection.getRangeAt(i);
+  return (
+    <Wrapper>
+      {drawingRegion ? <Region key={'drawing'} region={drawingRegion} /> : drawingRegion}
+    </Wrapper>
+  );
+});
 
-      if (r.endContainer.nodeType !== Node.TEXT_NODE) {
-        // offsets work differently for nodes and texts, so we have to find #text.
-        // lastChild because most probably this is div of the whole paragraph,
-        // and it has author div and phrase div.
-        const el = this.getPhraseElement(r.endContainer.lastChild);
-        let textNode = el;
+const SELECTION_COLOR = '#40A9FF';
+const SELECTION_SECOND_COLOR = 'white';
+const SELECTION_DASH = [3, 3];
 
-        while (textNode && textNode.nodeType !== Node.TEXT_NODE) {
-          textNode = textNode.firstChild;
-        }
+const SelectionBorders = observer(({ item, selectionArea }) => {
+  const { selectionBorders: bbox } = selectionArea;
 
-        // most probably this div is out of Paragraphs
-        // @todo maybe select till the end of Paragraphs?
-        if (!textNode) continue;
+  bbox.left = bbox.left * item.stageScale;
+  bbox.right = bbox.right * item.stageScale;
+  bbox.top = bbox.top * item.stageScale ;
+  bbox.bottom = bbox.bottom * item.stageScale ;
 
-        r.setEnd(textNode, 0);
-      }
+  const points = bbox ? [
+    {
+      x: bbox.left,
+      y: bbox.top,
+    },
+    {
+      x: bbox.right,
+      y: bbox.top,
+    },
+    {
+      x: bbox.left,
+      y: bbox.bottom,
+    },
+    {
+      x: bbox.right,
+      y: bbox.bottom,
+    },
+  ] : [];
 
-      if (r.collapsed || /^\s*$/.test(r.toString())) continue;
+  return (
+    <>
+      {bbox && (
+        <Rect
+          name="regions_selection"
+          x={bbox.left}
+          y={bbox.top}
+          width={bbox.right - bbox.left}
+          height={bbox.bottom - bbox.top}
+          stroke={SELECTION_COLOR}
+          strokeWidth={1}
+          listening={false}
+        />
+      )}
+      {points.map((point, idx) => {
+        return (
+          <Rect
+            key={idx}
+            x={point.x - 3}
+            y={point.y - 3}
+            width={6}
+            height={6}
+            fill={SELECTION_COLOR}
+            stroke={SELECTION_SECOND_COLOR}
+            strokeWidth={2}
+            listening={false}
+          />
+        );
+      })}
+    </>
+  );
+});
 
-      try {
-        splitBoundaries(r);
-        const [startOffset, , start, originalStart] = this.getOffsetInPhraseElement(r.startContainer, r.startOffset);
-        const [endOffset, , end, _originalEnd] = this.getOffsetInPhraseElement(r.endContainer, r.endOffset, false);
+const SelectionRect = observer(({ item }) => {
+  const { x, y, width, height } = item;
 
-        // if this shifts backwards, we need to take the lesser index.
-        const originalEnd = Math.min(end, _originalEnd);
-
-        if (isFF(FF_DEV_2918)) {
-          const visibleIndexes = item._value.reduce((visibleIndexes, v, idx) => {
-            const isContentVisible = item.isVisibleForAuthorFilter(v);
-
-            if (isContentVisible && originalStart <= idx && originalEnd >= idx) {
-              visibleIndexes.push(idx);
-            }
-
-            return visibleIndexes;
-          }, []);
-
-          if (visibleIndexes.length !== originalEnd - originalStart + 1) {
-            const texts = this.phraseElements;
-            let fromIdx = originalStart;
-
-            for (let k = 0; k < visibleIndexes.length; k++) {
-              const curIdx = visibleIndexes[k];
-              const isLastVisibleIndex = k === visibleIndexes.length - 1;
-
-              if (isLastVisibleIndex || visibleIndexes[k + 1] !== curIdx + 1) {
-                let anchorOffset, focusOffset;
-
-                const _range = r.cloneRange();
-
-                if (fromIdx === originalStart) {
-                  fromIdx = start;
-                  anchorOffset = startOffset;
-                } else {
-                  anchorOffset = 0;
-
-                  const walker = texts[fromIdx].ownerDocument.createTreeWalker(texts[fromIdx], NodeFilter.SHOW_ALL);
-
-                  while (walker.firstChild());
-
-                  _range.setStart(walker.currentNode, anchorOffset);
-                }
-                if (curIdx === end) {
-                  focusOffset = endOffset;
-                } else {
-                  const curRange = document.createRange();
-
-                  curRange.selectNode(texts[curIdx]);
-                  focusOffset = curRange.toString().length;
-
-                  const walker = texts[curIdx].ownerDocument.createTreeWalker(texts[curIdx], NodeFilter.SHOW_ALL);
-
-                  while (walker.lastChild());
-
-                  _range.setEnd(walker.currentNode, walker.currentNode.length);
-                }
-
-                selection.removeAllRanges();
-                selection.addRange(_range);
-
-                const text = this.removeSurroundingNewlines(selection.toString());
-
-                // Sometimes the selection is empty, which is the case for dragging from the end of a line above the
-                // target line, while having collapsed lines between.
-                if (text) {
-                  ranges.push({
-                    startOffset: anchorOffset,
-                    start: String(fromIdx),
-                    endOffset: focusOffset,
-                    end: String(curIdx),
-                    _range,
-                    text,
-                  });
-                }
-
-                if (visibleIndexes.length - 1 > k) {
-                  fromIdx = visibleIndexes[k + 1];
-                }
-              }
-            }
-          } else {
-            // user selection always has only one range, so we can use selection's text
-            // which doesn't contain hidden elements (names in our case)
-            ranges.push({
-              startOffset,
-              start: String(start),
-              endOffset,
-              end: String(end),
-              _range: r,
-              text: this.removeSurroundingNewlines(selection.toString()),
-            });
-          }
-        } else {
-          // user selection always has only one range, so we can use selection's text
-          // which doesn't contain hidden elements (names in our case)
-          ranges.push({
-            startOffset,
-            start: String(start),
-            endOffset,
-            end: String(end),
-            _range: r,
-            text: this.removeSurroundingNewlines(selection.toString()),
-          });
-        }
-      } catch (err) {
-        console.error('Can not get selection', err);
-      }
-    }
-
-    names.forEach(el => {
-      el.style.visibility = 'unset';
-    });
-
-    // BrowserRange#normalize() modifies the DOM structure and deselects the
-    // underlying text as a result. So here we remove the selected ranges and
-    // reapply the new ones.
-    selection.removeAllRanges();
-
-    return ranges;
-  }
-
-  _selectRegions = (additionalMode) => {
-    const { item } = this.props;
-    const root = this.myRef.current;
-    const selection = window.getSelection();
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-    const regions = [];
-
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-
-      if (node.nodeName === 'SPAN' && node.matches(this._regionSpanSelector) && isSelectionContainsSpan(node)) {
-        const region = this._determineRegion(node);
-
-        regions.push(region);
-      }
-    }
-    if (regions.length) {
-      if (additionalMode) {
-        item.annotation.extendSelectionWith(regions);
-      } else {
-        item.annotation.selectAreas(regions);
-      }
-      selection.removeAllRanges();
-    }
+  const positionProps = {
+    x,
+    y,
+    width,
+    height,
+    listening: false,
+    strokeWidth: 1,
   };
 
-  _determineRegion(element) {
-    if (matchesSelector(element, this._regionSpanSelector)) {
-      const span = element.tagName === 'SPAN' ? element : element.closest(this._regionSpanSelector);
-      const { item } = this.props;
+  return (
+    <>
+      <Rect
+        {...positionProps}
+        stroke={SELECTION_COLOR}
+        dash={SELECTION_DASH}
+      />
+      <Rect
+        {...positionProps}
+        stroke={SELECTION_SECOND_COLOR}
+        dash={SELECTION_DASH}
+        dashOffset={SELECTION_DASH[0]}
+      />
+    </>
+  );
+});
 
-      return item.regs.find(region => region.find(span));
-    }
+const TRANSFORMER_BACK_ID = 'transformer_back';
+
+const TransformerBack = observer(({ item }) => {
+  const { selectedRegionsBBox } = item;
+  const singleNodeMode = item.selectedRegions.length === 1;
+  const dragStartPointRef = useRef({ x: 0, y: 0 });
+
+  return (
+    <Layer>
+      {selectedRegionsBBox && !singleNodeMode && (
+        <Rect
+          id={TRANSFORMER_BACK_ID}
+          fill="rgba(0,0,0,0)"
+          draggable
+          onClick={()=>{
+            item.annotation.unselectAreas();
+          }}
+          onMouseOver={(ev) => {
+            if (!item.annotation.relationMode) {
+              ev.target.getStage().container().style.cursor = Constants.POINTER_CURSOR;
+            }
+          }}
+          onMouseOut={(ev) => {
+            ev.target.getStage().container().style.cursor = Constants.DEFAULT_CURSOR;
+          }}
+          onDragStart={e=>{
+            dragStartPointRef.current = {
+              x: e.target.getAttr('x'),
+              y: e.target.getAttr('y'),
+            };
+          }}
+          dragBoundFunc={(pos) => {
+            let { x, y } = pos;
+            const { top, left, right, bottom } =  item.selectedRegionsBBox;
+            const { stageHeight, stageWidth } = item;
+
+            const offset = {
+              x: dragStartPointRef.current.x-left,
+              y: dragStartPointRef.current.y-top,
+            };
+
+            x -=offset.x;
+            y -=offset.y;
+
+            const bbox = { x, y, width: right - left, height: bottom  - top };
+
+            const fixed = fixRectToFit(bbox, stageWidth, stageHeight);
+
+            if (fixed.width !== bbox.width) {
+              x += (fixed.width - bbox.width) * (fixed.x !== bbox.x ? -1 : 1);
+            }
+
+            if (fixed.height !== bbox.height) {
+              y += (fixed.height - bbox.height) * (fixed.y !== bbox.y ? -1 : 1);
+            }
+
+            x +=offset.x;
+            y +=offset.y;
+            return { x, y };
+          }}
+        />
+      )}
+    </Layer>
+  );
+});
+
+const SelectedRegions = observer(({ item, selectedRegions }) => {
+  if (!selectedRegions) return null;
+  const { brushRegions = [], shapeRegions = [] } = splitRegions(selectedRegions);
+
+  return (
+    <>
+      <TransformerBack item={item}/>
+      {brushRegions.length > 0 && (
+        <Regions
+          key="brushes"
+          name="brushes"
+          regions={brushRegions}
+          useLayers={false}
+          showSelected
+          chankSize={0}
+        />
+      )}
+
+      {shapeRegions.length > 0 && (
+        <Regions
+          key="shapes"
+          name="shapes"
+          regions={shapeRegions}
+          showSelected
+          chankSize={0}
+        />
+      )}
+    </>
+  );
+});
+
+const SelectionLayer = observer(({ item, selectionArea }) => {
+
+  const scale = 1 / (item.zoomScale || 1);
+
+  const [isMouseWheelClick, setIsMouseWheelClick] = useState(false);
+  const [shift, setShift] = useState(false);
+  const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === 'ZoomPanTool';
+
+  const dragHandler = (e) => setIsMouseWheelClick(e.buttons === 4);
+
+  const handleKey = (e) => setShift(e.shiftKey);
+
+  useEffect(()=>{
+    window.addEventListener('keydown', handleKey);
+    window.addEventListener('keyup', handleKey);
+    window.addEventListener('mousedown', dragHandler);
+    window.addEventListener('mouseup', dragHandler);
+    return () => {
+      window.removeEventListener('keydown', handleKey);
+      window.removeEventListener('keyup', handleKey);
+      window.removeEventListener('mousedown', dragHandler);
+      window.removeEventListener('mouseup', dragHandler);
+    };
+  },[]);
+
+  const disableTransform = item.zoomScale > 1 && (shift || isPanTool || isMouseWheelClick);
+
+  let supportsTransform = true;
+  let supportsRotate = true;
+  let supportsScale = true;
+
+  item.selectedRegions?.forEach(shape => {
+    supportsTransform = supportsTransform && shape.supportsTransform === true;
+    supportsRotate = supportsRotate && shape.canRotate === true;
+    supportsScale = supportsScale && true;
+  });
+
+  supportsTransform =
+    supportsTransform &&
+    (item.selectedRegions.length > 1 ||
+      ((item.useTransformer || item.selectedShape?.preferTransformer) && item.selectedShape?.useTransformer));
+
+  return (
+    <Layer scaleX={scale} scaleY={scale}>
+      {selectionArea.isActive ? (
+        <SelectionRect item={selectionArea} />
+      ) : !supportsTransform && item.selectedRegions.length > 1 ? (
+        <SelectionBorders item={item} selectionArea={selectionArea} />
+      ) : null}
+      <ImageTransformer
+        item={item}
+        rotateEnabled={supportsRotate}
+        supportsTransform={!disableTransform && supportsTransform}
+        supportsScale={supportsScale}
+        selectedShapes={item.selectedRegions}
+        singleNodeMode={item.selectedRegions.length === 1}
+        useSingleNodeRotation={item.selectedRegions.length === 1 && supportsRotate}
+        draggableBackgroundSelector={`#${TRANSFORMER_BACK_ID}`}
+      />
+    </Layer>
+  );
+});
+
+const Selection = observer(({ item, selectionArea }) => {
+
+  return (
+    <>
+      <SelectedRegions key="selected-regions" item={item} selectedRegions={item.selectedRegions} />
+      <SelectionLayer item={item} selectionArea={selectionArea}/>
+    </>
+  );
+});
+
+const Crosshair = memo(forwardRef(({ width, height }, ref) => {
+  const [pointsV, setPointsV] = useState([50, 0, 50, height]);
+  const [pointsH, setPointsH] = useState([0, 100, width, 100]);
+  const [x, setX] = useState(100);
+  const [y, setY] = useState(50);
+
+  const [visible, setVisible] = useState(false);
+  const strokeWidth = 1;
+  const dashStyle = [3, 3];
+  let enableStrokeScale = true;
+
+  if (isFF(FF_DEV_1285)) {
+    enableStrokeScale = false;
   }
 
-  onMouseUp(ev) {
-    const item = this.props.item;
-    const states = item.activeStates();
-
-    if (!states || states.length === 0 || ev.ctrlKey || ev.metaKey) return this._selectRegions(ev.ctrlKey || ev.metaKey);
-
-    const selectedRanges = this.captureDocumentSelection();
-
-    if (selectedRanges.length === 0) {
-      return;
-    }
-
-    item._currentSpan = null;
-
-    if (isFF(FF_DEV_2918)) {
-      const htxRanges = item.addRegions(selectedRanges);
-
-      for (const htxRange of htxRanges) {
-        const spans = htxRange.createSpans();
-
-        htxRange.addEventsToSpans(spans);
-      }
-    } else {
-      const htxRange = item.addRegion(selectedRanges[0]);
-
-      if (htxRange) {
-        const spans = htxRange.createSpans();
-
-        htxRange.addEventsToSpans(spans);
-      }
-    }
-  }
-
-  /**
-   * Generates a textual representation of the current selection range.
-   *
-   * @param {number} start
-   * @param {number} end
-   * @param {number} startOffset
-   * @param {number} endOffset
-   * @returns {string}
-   */
-  _getResultText(start, end, startOffset, endOffset) {
-    const phrases = this.phraseElements;
-
-    if (start === end) return phrases[start].innerText.slice(startOffset, endOffset);
-
-    return [
-      phrases[start].innerText.slice(startOffset),
-      phrases.slice(start + 1, end).map(phrase => phrase.innerText),
-      phrases[end].innerText.slice(0, endOffset),
-    ].flat().join('');
-  }
-
-  _handleUpdate() {
-    const root = this.myRef.current;
-    const { item } = this.props;
-
-    // wait until text is loaded
-    if (!item._value) return;
-
-    item.regs.forEach((r, i) => {
-      // spans can be totally missed if this is app init or undo/redo
-      // or they can be disconnected from DOM on annotations switching
-      // so we have to recreate them from regions data
-      if (r._spans?.[0]?.isConnected) return;
-
-      try {
-        const phrases = root.children;
-        const range = document.createRange();
-        const startNode = phrases[r.start].getElementsByClassName(item.layoutClasses.text)[0];
-        const endNode = phrases[r.end].getElementsByClassName(item.layoutClasses.text)[0];
-
-        let { startOffset, endOffset } = r;
-
-        range.setStart(...findNodeAt(startNode, startOffset));
-        range.setEnd(...findNodeAt(endNode, endOffset));
-
-        if (r.text && range.toString().replace(/\s+/g, '') !== r.text.replace(/\s+/g, '')) {
-          console.info('Restore broken position', i, range.toString(), '->', r.text, r);
-          if (
-            // span breaks the mock-up by its end, so the start of next one is wrong
-            item.regs.slice(0, i).some(other => r.start === other.end) &&
-            // for now there are no fallback for huge wrong regions
-            r.start === r.end
-          ) {
-            // find region's text in the node (disregarding spaces)
-            const match = startNode.textContent.match(new RegExp(r.text.replace(/\s+/g, '\\s+')));
-
-            if (!match) console.warn('Can\'t find the text', r);
-            const { index = 0 } = match || {};
-
-            if (r.endOffset - r.startOffset !== r.text.length)
-              console.warn('Text length differs from region length; possible regions overlap');
-            startOffset = index;
-            endOffset = startOffset + r.text.length;
-
-            range.setStart(...findNodeAt(startNode, startOffset));
-            range.setEnd(...findNodeAt(endNode, endOffset));
-            r.fixOffsets(startOffset, endOffset);
-          }
-        } else if (!r.text && range.toString()) {
-          r.setText(this._getResultText(+r.start, +r.end, startOffset, endOffset));
+  if (ref) {
+    ref.current = {
+      updatePointer(newX, newY) {
+        if (newX !== x) {
+          setX(newX);
+          setPointsV([newX, 0, newX, height]);
         }
 
-        splitBoundaries(range);
+        if (newY !== y) {
+          setY(newY);
+          setPointsH([0, newY, width, newY]);
+        }
+      },
+      updateVisibility(visibility) {
+        setVisible(visibility);
+      },
+    };
+  }
 
-        r._range = range;
-        const spans = r.createSpans();
+  return (
+    <Layer
+      name="crosshair"
+      listening={false}
+      opacity={visible ? 0.6 : 0}
+    >
+      <Group>
+        <Line
+          name="v-white"
+          points={pointsH}
+          stroke="#fff"
 
-        r.addEventsToSpans(spans);
-      } catch (err) {
-        console.log(err, r);
+        />
+        <Line
+          name="v-black"
+          points={pointsH}
+          stroke="#000"
+          strokeWidth={strokeWidth}
+          dash={dashStyle}
+
+        />
+      </Group>
+      <Group>
+        <Line
+          name="h-white"
+          points={pointsV}
+          stroke="#fff"
+          strokeWidth={strokeWidth}
+
+        />
+        <Line
+          name="h-black"
+          points={pointsV}
+          stroke="#000"
+          strokeWidth={strokeWidth}
+          dash={dashStyle}
+
+        />
+      </Group>
+    </Layer>
+  );
+}));
+
+export default observer(
+  class ImageView extends Component {
+    // stored position of canvas before creating region
+    canvasX;
+    canvasY;
+    lastOffsetWidth = -1;
+    lastOffsetHeight = -1;
+    state = {
+      imgStyle: {},
+      pointer: [0, 0],
+    };
+
+    imageRef = createRef();
+    crosshairRef = createRef();
+    handleDeferredMouseDown = null;
+    deferredClickTimeout = [];
+    skipMouseUp = false;
+
+    constructor(props) {
+      super(props);
+
+      if (typeof props.item.smoothing === 'boolean')
+        props.store.settings.setSmoothing(props.item.smoothing);
+    }
+
+    handleOnClick = e => {
+      const { item } = this.props;
+
+      if (isFF(FF_DEV_1442)) {
+        this.handleDeferredMouseDown?.();
       }
-    });
+      if (this.skipMouseUp) {
+        this.skipMouseUp = false;
+        return;
+      }
 
-    Array.from(this.myRef.current.getElementsByTagName('a')).forEach(a => {
-      a.addEventListener('click', function(ev) {
-        ev.preventDefault();
-        return false;
-      });
-    });
-  }
+      const evt = e.evt || e;
 
-  componentDidUpdate() {
-    this._handleUpdate();
-  }
+      return item.event('click', evt, evt.offsetX, evt.offsetY);
+    };
 
-  componentDidMount() {
-    this._handleUpdate();
-  }
+    resetDeferredClickTimeout = () => {
+      if (this.deferredClickTimeout.length > 0) {
+        this.deferredClickTimeout = this.deferredClickTimeout.filter((timeout) => {
+          clearTimeout(timeout);
+          return false;
+        });
+      }
+    };
 
-  render() {
-    const { item } = this.props;
-    const withAudio = !!item.audio;
+    handleDeferredClick = (handleDeferredMouseDownCallback, handleDeselection, eligibleToDeselect = false) => {
+      this.handleDeferredMouseDown = () => {
+        if (eligibleToDeselect) {
+          handleDeselection();
+        }
+        handleDeferredMouseDownCallback();
+      };
+      this.resetDeferredClickTimeout();
+      this.deferredClickTimeout.push(setTimeout(() => {
+        this.handleDeferredMouseDown?.();
+      }, this.props.item.annotation.isDrawing ? 0 : 100));
+    };
 
-    // current way to not render when we wait for data
-    if (isFF(FF_DEV_2669) && !item._value) return null;
+    handleMouseDown = e => {
+      const { item } = this.props;
+      const isPanTool = item.getToolsManager().findSelectedTool()?.fullName === 'ZoomPanTool';
 
-    return (
-      <ObjectTag item={item} className={'lsf-paragraphs'}>
-        {withAudio && (
-          <audio
-            {...audioDefaultProps} 
-            controls={item.showplayer && !item.syncedAudio}
-            className={styles.audio}
-            src={item.audio}
-            {...(isFF(FF_LSDV_3012) ? {
-              ref: item.audioRef,
-              onLoadedMetadata: item.handleAudioLoaded,
-            } : {
-              ref: item.getRef(),
-            })}
-            onEnded={item.reset}
-            onError={item.handleError}
-            onCanPlay={item.handleCanPlay}
-          />
-        )}
-        {isFF(FF_DEV_2669) && <AuthorFilter item={item} />}
-        <div
-          ref={this.myRef}
-          data-update={item._update}
-          className={styles.container}
-          onMouseUp={this.onMouseUp.bind(this)}
+      item.updateSkipInteractions(e);
+
+      const p = e.target.getParent();
+
+      if (!item.annotation.editable && !isPanTool) return;
+      if (p && p.className === 'Transformer') return;
+
+      const handleMouseDown = () => {
+        if (
+        // create regions over another regions with Cmd/Ctrl pressed
+          item.getSkipInteractions() ||
+          e.target === item.stageRef ||
+          findClosestParent(
+            e.target,
+            el => el.nodeType === 'Group' && ['ruler', 'segmentation'].indexOf(el?.attrs?.name) > -1,
+          )
+        ) {
+          window.addEventListener('mousemove', this.handleGlobalMouseMove);
+          window.addEventListener('mouseup', this.handleGlobalMouseUp);
+          const { offsetX: x, offsetY: y } = e.evt;
+          // store the canvas coords for calculations in further events
+          const { left, top } = item.containerRef.getBoundingClientRect();
+
+          this.canvasX = left;
+          this.canvasY = top;
+          item.event('mousedown', e, x, y);
+
+          return true;
+        }
+      };
+
+      const selectedTool = item.getToolsManager().findSelectedTool();
+      const eligibleToolForDeselect = [
+        undefined,
+        'EllipseTool',
+        'EllipseTool-dynamic',
+        'RectangleTool',
+        'RectangleTool-dynamic',
+        'PolygonTool',
+        'PolygonTool-dynamic',
+        'Rectangle3PointTool',
+        'Rectangle3PointTool-dynamic',
+      ].includes(selectedTool?.fullName);
+
+      if (isFF(FF_DEV_1442) && eligibleToolForDeselect) {
+        const targetIsCanvas = e.target === item.stageRef;
+        const annotationHasSelectedRegions = item.annotation.selectedRegions.length > 0;
+        const eligibleToDeselect = targetIsCanvas && annotationHasSelectedRegions;
+
+        const handleDeselection = () => {
+          item.annotation.unselectAll();
+          this.skipMouseUp = true;
+        };
+
+        this.handleDeferredClick(handleMouseDown, handleDeselection, eligibleToDeselect);
+        return;
+      }
+
+      const result = handleMouseDown();
+
+      if (result) return result;
+
+      return true;
+    };
+
+    /**
+     * Mouse up outside the canvas
+     */
+    handleGlobalMouseUp = e => {
+      window.removeEventListener('mousemove', this.handleGlobalMouseMove);
+      window.removeEventListener('mouseup', this.handleGlobalMouseUp);
+
+      if (e.target && e.target.tagName === 'CANVAS') return;
+
+      const { item } = this.props;
+      const { clientX: x, clientY: y } = e;
+
+      item.freezeHistory();
+
+      return item.event('mouseup', e, x - this.canvasX, y - this.canvasY);
+    };
+
+    handleGlobalMouseMove = e => {
+      if (e.target && e.target.tagName === 'CANVAS') return;
+
+      const { item } = this.props;
+      const { clientX: x, clientY: y } = e;
+
+      return item.event('mousemove', e, x - this.canvasX, y - this.canvasY);
+    };
+
+    /**
+     * Mouse up on Stage
+     */
+    handleMouseUp = e => {
+      const { item } = this.props;
+
+      if (isFF(FF_DEV_1442)) {
+        this.resetDeferredClickTimeout();
+      }
+
+      item.freezeHistory();
+      item.setSkipInteractions(false);
+
+      return item.event('mouseup', e, e.evt.offsetX, e.evt.offsetY);
+    };
+
+    handleMouseMove = e => {
+      const { item } = this.props;
+
+      item.freezeHistory();
+
+      this.updateCrosshair(e);
+
+      const isMouseWheelClick = e.evt && e.evt.buttons === 4;
+      const isDragging = e.evt && e.evt.buttons === 1;
+      const isShiftDrag = isDragging && e.evt.shiftKey;
+
+      if (isFF(FF_DEV_1442) && isDragging) {
+        this.resetDeferredClickTimeout();
+        this.handleDeferredMouseDown?.();
+      }
+
+      if ((isMouseWheelClick || isShiftDrag) && item.zoomScale > 1) {
+        item.setSkipInteractions(true);
+        e.evt.preventDefault();
+
+        const newPos = {
+          x: item.zoomingPositionX + e.evt.movementX,
+          y: item.zoomingPositionY + e.evt.movementY,
+        };
+
+        item.setZoomPosition(newPos.x, newPos.y);
+      } else {
+        item.event('mousemove', e, e.evt.offsetX, e.evt.offsetY);
+      }
+    };
+
+    updateCrosshair = (e) => {
+      if (this.crosshairRef.current) {
+        const { x, y } = e.currentTarget.getPointerPosition();
+
+
+      }
+    };
+
+    handleError = () => {
+      const { item, store } = this.props;
+      const cs = store.annotationStore;
+      const message = getEnv(store).messages.ERR_LOADING_HTTP({ attr: item.value, error: '', url: item._value });
+
+      cs.addErrors([errorBuilder.generalError(message)]);
+    };
+
+    updateGridSize = range => {
+      const { item } = this.props;
+
+      item.freezeHistory();
+
+      item.setGridSize(range);
+    };
+
+    /**
+     * Handle to zoom
+     */
+    handleZoom = e => {
+      /**
+       * Disable if user doesn't use ctrl
+       */
+      if (e.evt && !e.evt.ctrlKey) {
+        return;
+      } else if (e.evt && e.evt.ctrlKey) {
+        /**
+         * Disable scrolling page
+         */
+        e.evt.preventDefault();
+      }
+      if (e.evt) {
+        const { item } = this.props;
+        const stage = item.stageRef;
+
+        item.handleZoom(e.evt.deltaY, stage.getPointerPosition());
+      }
+    };
+
+    renderRulers() {
+      const { item } = this.props;
+      const width = 1;
+      const color = 'white';
+
+      return (
+        <Group
+          name="ruler"
+          onClick={ev => {
+            ev.cancelBubble = false;
+          }}
         >
-          <Phrases item={item} />
-        </div>
-      </ObjectTag>
-    );
-  }
-}
+          <Line
+            x={0}
+            y={item.cursorPositionY}
+            points={[0, 0, item.stageWidth, 0]}
+            strokeWidth={width}
+            stroke={color}
+            tension={0}
+            dash={[4, 4]}
+            closed
+          />
+          <Line
+            x={item.cursorPositionX}
+            y={0}
+            points={[0, 0, 0, item.stageHeight]}
+            strokeWidth={width}
+            stroke={color}
+            tension={0}
+            dash={[1.5]}
+            closed
+          />
+        </Group>
+      );
+    }
 
-export const HtxParagraphs = inject('store')(observer(HtxParagraphsView));
+    onResize = debounce(() => {
+      if (!this?.props?.item?.containerRef) return;
+      const { offsetWidth, offsetHeight } = this.props.item.containerRef;
+
+      if (this.props.item.naturalWidth <= 1) return;
+      if (this.lastOffsetWidth === offsetWidth && this.lastOffsetHeight === offsetHeight) return;
+
+      this.props.item.onResize(offsetWidth, offsetHeight, true);
+      this.lastOffsetWidth = offsetWidth;
+      this.lastOffsetHeight = offsetHeight;
+    }, 16);
+
+    componentDidMount() {
+      const { item } = this.props;
+
+      window.addEventListener('resize', this.onResize);
+      this.attachObserver(item.containerRef);
+      this.updateReadyStatus();
+
+      hotkeys.addDescription('shift', 'Pan image');
+    }
+
+    attachObserver = (node) => {
+      if (this.resizeObserver) this.detachObserver();
+
+      if (node) {
+        this.resizeObserver = new ResizeObserver(this.onResize);
+        this.resizeObserver.observe(node);
+      }
+    };
+
+    detachObserver = () => {
+      if (this.resizeObserver) {
+        this.resizeObserver.disconnect();
+        this.resizeObserver = null;
+      }
+    };
+
+    componentWillUnmount() {
+      this.detachObserver();
+      window.removeEventListener('resize', this.onResize);
+
+      hotkeys.removeDescription('shift');
+    }
+
+    componentDidUpdate() {
+      this.onResize();
+      this.updateReadyStatus();
+    }
+
+    updateReadyStatus() {
+      const { item } = this.props;
+      const { imageRef } = this;
+
+      if (!item || !isAlive(item) || !imageRef.current) return;
+      if (item.isReady !== imageRef.current.complete) item.setReady(imageRef.current.complete);
+    }
+
+    renderTools() {
+      const { item, store } = this.props;
+      const cs = store.annotationStore;
+
+      if (cs.viewingAllAnnotations || cs.viewingAllPredictions) return null;
+
+      const tools = item.getToolsManager().allTools();
+
+      return (
+        <Toolbar tools={tools} />
+      );
+    }
+
+    render() {
+
+      const { item, store } = this.props;
+
+      // @todo stupid but required check for `resetState()`
+      // when Image tries to render itself after detouching
+      if (!isAlive(item)) return null;
+
+      // TODO fix me
+      if (!store.task || !item._value) return null;
+
+      const regions = item.regs;
+
+
+      const containerStyle = {};
+
+      const containerClassName = styles.container;
+
+      if (getRoot(item).settings.fullscreen === false) {
+        containerStyle['maxWidth'] = item.maxwidth;
+        containerStyle['maxHeight'] = item.maxheight;
+        containerStyle['width'] = item.width;
+        containerStyle['height'] = item.height;
+      }
+
+      if (!this.props.store.settings.enableSmoothing && item.zoomScale > 1){
+        containerStyle['imageRendering'] = 'pixelated';
+      }
+
+      const imagePositionClassnames =  [
+        styles['image_position'],
+        styles[`image_position__${item.verticalalignment === 'center' ? 'middle' : item.verticalalignment}`],
+        styles[`image_position__${item.horizontalalignment}`],
+      ];
+
+      const wrapperClasses = [
+        styles.wrapperComponent,
+        item.images.length > 1 ? styles.withGallery : styles.wrapper,
+      ];
+
+      const {
+        brushRegions,
+        shapeRegions,
+      } = splitRegions(regions);
+
+      const {
+        brushRegions: suggestedBrushRegions,
+        shapeRegions: suggestedShapeRegions,
+      } = splitRegions(item.suggestions);
+
+      const renderableRegions = Object.entries({
+        brush: brushRegions,
+        shape: shapeRegions,
+        suggestedBrush: suggestedBrushRegions,
+        suggestedShape: suggestedShapeRegions,
+      });
+
+      return (
+        <ObjectTag
+          item={item}
+          className={wrapperClasses.join(' ')}
+        >
+          <div
+            ref={node => {
+              item.setContainerRef(node);
+              this.attachObserver(node);
+            }}
+            className={containerClassName}
+            style={containerStyle}
+          >
+            <div
+              ref={node => {
+                this.filler = node;
+              }}
+              className={styles.filler}
+              style={{ width: '100%', marginTop: item.fillerHeight }}
+            />
+            <div
+              className={[
+                styles.frame,
+                ...imagePositionClassnames,
+              ].join(' ')}
+              style={item.canvasSize}
+            >
+              <img
+                ref={ref => {
+                  item.setImageRef(ref);
+                  this.imageRef.current = ref;
+                }}
+                loading={(isFF(FF_DEV_3077) && !item.lazyoff) && 'lazy'}
+                style={item.imageTransform}
+                src={item._value}
+                onLoad={item.updateImageSize}
+                onError={this.handleError}
+                crossOrigin={item.imageCrossOrigin}
+                alt="LS"
+              />
+              {isFF(FF_DEV_4081)
+                ? (
+                  <canvas
+                    className={styles.overlay}
+                    ref={ref => {
+                      item.setOverlayRef(ref);
+                    }}
+                    style={item.imageTransform}
+                  />
+
+          {this.renderTools()}
+          {item.images.length > 1 && (
+            <div className={styles.gallery}>
+              {item.images.map((src, i) => (
+                <img
+                  alt=""
+                  key={src}
+                  src={src}
+                  className={i === item.currentImage && styles.active}
+                  height="60"
+                  onClick={() => item.setCurrentImage(i)}
+                />
+              ))}
+            </div>
+          )}
+        </ObjectTag>
+      );
+    }
+  },
+);
